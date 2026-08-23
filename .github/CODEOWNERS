@@ -1,0 +1,5 @@
+# What this is: who GitHub asks to review changes, per part of the project.
+# The last matching line wins. "*" means everything.
+# Safe to edit: yes — shipshape will ask before overwriting your edits.
+# managed-by: shipshape v0.2.1
+* @KevNev19

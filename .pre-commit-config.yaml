@@ -1,0 +1,16 @@
+# What this is: configuration for the pre-commit framework — checks that run
+# on your computer each time you commit. Hook ORDER IS LOAD-BEARING: the
+# secret guard runs first and is referenced here, not reimplemented — the
+# script in .sdlc/hooks/secret-guard.sh stays the single source of truth.
+# Safe to edit: yes — shipshape will ask before overwriting your edits.
+# managed-by: shipshape v0.2.1
+fail_fast: true
+repos:
+  - repo: local
+    hooks:
+      - id: secret-guard
+        name: secret guard (blocks committed credentials)
+        entry: .sdlc/hooks/secret-guard.sh
+        language: script
+        pass_filenames: false
+        always_run: true

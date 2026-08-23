@@ -1,0 +1,136 @@
+# What this is: a weekly check that makes sure shipshape's protections are
+# still present and connected, with a manual run button for on-demand checks.
+# Safe to edit: yes — shipshape will ask before overwriting your edits.
+# managed-by: shipshape v0.2.1
+name: shipshape health check
+
+on:
+  schedule:
+    - cron: "41 4 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run shipshape doctor
+        id: doctor
+        shell: bash
+        run: |
+          set +e
+          python3 .sdlc/scripts/doctor.py . > "$RUNNER_TEMP/shipshape-doctor.json"
+          doctor_status=$?
+          set -e
+          if [ "$doctor_status" -gt 1 ]; then
+            echo "shipshape doctor crashed with exit $doctor_status" >&2
+            exit "$doctor_status"
+          fi
+          python3 - "$RUNNER_TEMP/shipshape-doctor.json" "$doctor_status" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          status = int(sys.argv[2])
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          required = {"ok", "set_up", "counts", "sections", "next_action"}
+          if not required.issubset(payload):
+              raise SystemExit("shipshape doctor returned an incomplete scorecard")
+          counts = payload["counts"]
+          if not all(isinstance(counts.get(key), int) for key in ("PASS", "WARN", "FAIL")):
+              raise SystemExit("shipshape doctor returned invalid counts")
+          expected_status = 1 if counts["FAIL"] else 0
+          if status != expected_status:
+              raise SystemExit("shipshape doctor exit status did not match its scorecard")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"has_findings={'true' if counts['WARN'] or counts['FAIL'] else 'false'}\n")
+          PY
+      - name: Write health summary
+        run: |
+          python3 - "$RUNNER_TEMP/shipshape-doctor.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          counts = payload["counts"]
+          lines = [
+              "# shipshape health check",
+              "",
+              f"- PASS: {counts['PASS']}",
+              f"- WARN: {counts['WARN']}",
+              f"- FAIL: {counts['FAIL']}",
+              "",
+              f"Next action: {payload['next_action']}",
+              "",
+          ]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines))
+          PY
+      - name: Open or update health issue
+        if: steps.doctor.outputs.has_findings == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          issue_body="$RUNNER_TEMP/shipshape-doctor-issue.md"
+          python3 - "$RUNNER_TEMP/shipshape-doctor.json" "$issue_body" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          counts = payload["counts"]
+          lines = [
+              "The scheduled shipshape health check found something that needs attention.",
+              "",
+              f"- PASS: {counts['PASS']}",
+              f"- WARN: {counts['WARN']}",
+              f"- FAIL: {counts['FAIL']}",
+              "",
+              f"Next action: {payload['next_action']}",
+              "",
+              "This issue is updated by the weekly health check and is not closed automatically.",
+          ]
+          Path(sys.argv[2]).write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+          label="shipshape-health"
+          title="shipshape health check"
+          issue_error=""
+          if ! gh label view "$label" >/dev/null 2>&1; then
+            if ! gh label create "$label" --color "1D76DB" \
+              --description "Shipshape scheduled health findings" >/dev/null 2>&1; then
+              issue_error="the health label could not be created"
+            fi
+          fi
+          if [ -z "$issue_error" ]; then
+            set +e
+            issue_number="$(gh issue list --state open --label "$label" \
+              --json number,title --jq '.[] | select(.title == "shipshape health check") | .number' \
+              --limit 100 | head -n 1)"
+            list_status=$?
+            set -e
+            if [ "$list_status" -ne 0 ]; then
+              issue_error="open health issues could not be listed"
+            elif [ -n "$issue_number" ]; then
+              if ! gh issue edit "$issue_number" --body-file "$issue_body" >/dev/null 2>&1; then
+                issue_error="the existing health issue could not be updated"
+              fi
+            elif ! gh issue create --title "$title" --label "$label" \
+              --body-file "$issue_body" >/dev/null 2>&1; then
+              issue_error="a health issue could not be opened"
+            fi
+          fi
+          if [ -n "$issue_error" ]; then
+            {
+              echo ""
+              echo "> The scorecard is complete, but $issue_error. Check the workflow's issues permission."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

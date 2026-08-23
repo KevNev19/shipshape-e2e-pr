@@ -1,0 +1,25 @@
+# What this is: turns a version tag (like v1.2.0) into a GitHub release with
+# human-readable notes, automatically. Cut releases with /shipshape-release.
+# Safe to edit: yes — shipshape will ask before overwriting your edits.
+# managed-by: shipshape v0.2.1
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# This workflow needs to write (it creates the release itself).
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Create GitHub release with generated notes
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}

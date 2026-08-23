@@ -1,0 +1,15 @@
+# What this is: Dependabot — GitHub's dependency watcher. When a library this
+# project uses gets a security fix or update, it opens a pull request with
+# the upgrade so you never run known-vulnerable code for long.
+# Safe to edit: yes — shipshape will ask before overwriting your edits.
+# managed-by: shipshape v0.2.1
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"

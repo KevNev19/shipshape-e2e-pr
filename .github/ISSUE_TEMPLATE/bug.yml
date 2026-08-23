@@ -1,0 +1,21 @@
+# What this is: the form GitHub shows when someone reports a problem.
+# Safe to edit: yes — shipshape will ask before overwriting your edits.
+# managed-by: shipshape v0.2.1
+name: Something is broken
+description: Report a problem with shipshape-e2e-pr
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How can someone else make it happen?
+      description: Step-by-step, so the problem can be reproduced.
+    validations:
+      required: false

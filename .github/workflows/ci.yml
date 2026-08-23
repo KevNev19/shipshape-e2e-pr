@@ -1,0 +1,31 @@
+# What this is: automated checks (CI) that run on GitHub every time code is
+# pushed. A green check means the tests passed; a red X means something broke.
+# Safe to edit: yes — shipshape will ask before overwriting your edits.
+# managed-by: shipshape v0.2.1
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+# Least privilege: this workflow only needs to read the code.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true; fi
+      - name: Run tests
+        run: pytest

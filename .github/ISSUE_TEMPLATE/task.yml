@@ -1,0 +1,20 @@
+# What this is: the form GitHub shows when someone proposes work to do.
+# Safe to edit: yes — shipshape will ask before overwriting your edits.
+# managed-by: shipshape v0.2.1
+name: Something to do
+description: Propose a task or improvement for shipshape-e2e-pr
+labels: ["task"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What should be done?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why does it matter?
+      description: If an intent file exists under docs/changes/, link to it here.
+    validations:
+      required: false

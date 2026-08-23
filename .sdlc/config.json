@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "kit_version": "0.2.1",
+  "profile": "team",
+  "workflow_style": "pr",
+  "project_name": "shipshape-e2e-pr",
+  "languages": [
+    "python"
+  ],
+  "default_branch": "main",
+  "features": {
+    "codeql": true,
+    "dependabot": true,
+    "secret_guard": true,
+    "branch_protection": true,
+    "release_automation": true,
+    "issue_templates": true,
+    "github_agents": true,
+    "scheduled_health": true,
+    "tiered_review": true
+  },
+  "commands": {
+    "test": "pytest",
+    "lint": ""
+  },
+  "toolchain": {
+    "python": "3.12",
+    "node": "20",
+    "go": "1.22"
+  },
+  "release": {
+    "versioning": "semver"
+  },
+  "owners": {
+    "default": "@KevNev19"
+  },
+  "repo": {
+    "owner_repo": "KevNev19/shipshape-e2e-pr"
+  }
+}

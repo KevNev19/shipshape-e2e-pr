@@ -1,0 +1,558 @@
+# What this is: enables auto-merge for two narrow low-risk pull request
+# classes after branch-protection checks pass, with an audited break-glass path.
+# Safe to edit: yes — shipshape will ask before overwriting your edits.
+# managed-by: shipshape v0.2.1
+name: Low-risk auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: low-risk-automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    env:
+      API_PAGE_SIZE: "100"
+    steps:
+      - name: Inspect pull request metadata through the API
+        id: inspect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pr_json="$RUNNER_TEMP/shipshape-pr.json"
+          files_json="$RUNNER_TEMP/shipshape-pr-files.json"
+          commits_json="$RUNNER_TEMP/shipshape-pr-commits.json"
+
+          mark_unavailable() {
+            {
+              echo "class_name=none"
+              echo "class_reason=metadata: unavailable; file count: unknown; file records: unknown"
+              echo "has_break_glass=false"
+              echo "classified_head="
+              echo "head_valid=false"
+            } >> "$GITHUB_OUTPUT"
+            echo "Not eligible: GitHub metadata could not be read."
+            exit 0
+          }
+
+          if ! gh pr view "$PR_NUMBER" --repo "$GH_REPO" \
+            --json author,body,commits,headRefOid,changedFiles,labels > "$pr_json"; then
+            mark_unavailable
+          fi
+          if ! gh api --paginate --slurp \
+            "repos/$GH_REPO/pulls/$PR_NUMBER/files?per_page=$API_PAGE_SIZE" \
+            > "$files_json"; then
+            mark_unavailable
+          fi
+          if ! gh api --paginate --slurp \
+            "repos/$GH_REPO/pulls/$PR_NUMBER/commits?per_page=$API_PAGE_SIZE" \
+            > "$commits_json"; then
+            mark_unavailable
+          fi
+
+          if ! python3 - \
+            "$pr_json" "$files_json" "$commits_json" "$GITHUB_OUTPUT" <<'PY'
+          import fnmatch
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          MAX_INSPECTABLE_FILES = 3000
+
+
+          def paginated_items(path):
+              payload = json.loads(Path(path).read_text(encoding="utf-8"))
+              if not isinstance(payload, list):
+                  return []
+              if payload and all(isinstance(page, list) for page in payload):
+                  return [item for page in payload for item in page]
+              return payload
+
+
+          def commit_logins(commit):
+              author = commit.get("author") if isinstance(commit, dict) else None
+              if isinstance(author, dict) and isinstance(author.get("login"), str):
+                  return [author["login"]]
+              authors = commit.get("authors", []) if isinstance(commit, dict) else []
+              return [
+                  item.get("login", "")
+                  for item in authors
+                  if isinstance(item, dict)
+              ]
+
+
+          def commit_message(commit):
+              details = commit.get("commit") if isinstance(commit, dict) else None
+              if isinstance(details, dict):
+                  return details.get("message") or ""
+              if not isinstance(commit, dict):
+                  return ""
+              return "\n".join(
+                  [commit.get("messageHeadline") or "", commit.get("messageBody") or ""]
+              )
+
+
+          pr = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          files = paginated_items(sys.argv[2])
+          commits = paginated_items(sys.argv[3])
+          expected_commit_records = pr.get("commits") if isinstance(pr, dict) else None
+          changed_files = pr.get("changedFiles") if isinstance(pr, dict) else None
+          classified_head = pr.get("headRefOid", "") if isinstance(pr, dict) else ""
+          labels = pr.get("labels", []) if isinstance(pr, dict) else []
+          head_valid = (
+              isinstance(classified_head, str)
+              and re.fullmatch(r"[0-9a-f]{40,64}", classified_head) is not None
+          )
+          file_records_valid = all(
+              isinstance(item, dict)
+              and isinstance(item.get("filename"), str)
+              and bool(item["filename"])
+              and isinstance(item.get("status"), str)
+              for item in files
+          )
+          file_count_mismatch = (
+              not isinstance(changed_files, int) or len(files) != changed_files
+          )
+          metadata_complete = (
+              isinstance(pr, dict)
+              and isinstance(changed_files, int)
+              and 0 < changed_files <= MAX_INSPECTABLE_FILES
+              and not file_count_mismatch
+              and file_records_valid
+              and isinstance(expected_commit_records, list)
+              and len(expected_commit_records) == len(commits)
+              and isinstance(labels, list)
+              and head_valid
+          )
+
+          has_break_glass = isinstance(labels, list) and any(
+              isinstance(label, dict) and label.get("name") == "break-glass-automerge"
+              for label in labels
+          )
+          if not metadata_complete:
+              class_name = "none"
+              class_reason = (
+                  "metadata: incomplete; "
+                  f"file count: {changed_files!r}; file records: {len(files)}"
+              )
+          else:
+              protected_exact = {"AGENTS.md", "CLAUDE.md", "SECURITY.md"}
+              protected_prefixes = (
+                  ".github/",
+                  ".sdlc/",
+                  ".claude/",
+                  ".vscode/",
+                  "docs/sdlc/",
+                  "docs/adr/",
+              )
+              documentation_suffixes = (
+                  ".md",
+                  ".markdown",
+                  ".rst",
+                  ".txt",
+                  ".adoc",
+                  ".asciidoc",
+              )
+              dependency_names = {
+                  "package.json",
+                  "package-lock.json",
+                  "yarn.lock",
+                  "pnpm-lock.yaml",
+                  "pyproject.toml",
+                  "poetry.lock",
+                  "uv.lock",
+                  "go.mod",
+                  "go.sum",
+                  "Cargo.toml",
+                  "Cargo.lock",
+                  "Gemfile",
+                  "Gemfile.lock",
+                  "gradle.lockfile",
+              }
+
+              def is_protected(path):
+                  return path in protected_exact or path.startswith(protected_prefixes)
+
+              def is_documentation(path):
+                  if is_protected(path):
+                      return False
+                  return path.endswith(".md") or (
+                      path.startswith("docs/") and path.endswith(documentation_suffixes)
+                  )
+
+              def is_dependency_file(path):
+                  if is_protected(path):
+                      return False
+                  name = path.rsplit("/", 1)[-1]
+                  return (
+                      name in dependency_names
+                      or fnmatch.fnmatchcase(name, "requirements*.txt")
+                      or fnmatch.fnmatchcase(name, "*.gradle")
+                  )
+
+              changed = [(item["filename"], item["status"]) for item in files]
+              docs_only = all(is_documentation(path) for path, _status in changed)
+              author = pr.get("author")
+              author_login = author.get("login", "") if isinstance(author, dict) else ""
+              author_is_dependabot = author_login == "dependabot[bot]"
+              dependency_files_only = all(
+                  is_dependency_file(path) and status == "modified"
+                  for path, status in changed
+              )
+              commit_authors_are_dependabot = bool(commits) and all(
+                  commit_logins(commit)
+                  and all(login == "dependabot[bot]" for login in commit_logins(commit))
+                  for commit in commits
+              )
+              dependency_metadata = "\n".join(
+                  [pr.get("body") or "", *[commit_message(item) for item in commits]]
+              )
+              patch_update = "version-update:semver-patch" in dependency_metadata
+              minor_update = "version-update:semver-minor" in dependency_metadata
+              major_update = "version-update:semver-major" in dependency_metadata
+
+              if docs_only:
+                  class_name = "docs-only"
+                  class_reason = "all changed paths are ordinary documentation"
+              elif not author_is_dependabot:
+                  class_name = "none"
+                  class_reason = "change is not docs-only and the author is not dependabot[bot]"
+              elif not dependency_files_only:
+                  class_name = "none"
+                  class_reason = "Dependabot changed an unknown, new, deleted, or renamed path"
+              elif not commit_authors_are_dependabot:
+                  class_name = "none"
+                  class_reason = "a commit is not attributed to dependabot[bot]"
+              elif not patch_update or minor_update or major_update:
+                  class_name = "none"
+                  class_reason = "Dependabot patch update metadata could not be determined"
+              else:
+                  class_name = "dependency-bot-patch"
+                  class_reason = "Dependabot patch update changes only known dependency files"
+
+          with Path(sys.argv[4]).open("a", encoding="utf-8") as output:
+              output.write(f"class_name={class_name}\n")
+              output.write(f"class_reason={class_reason}\n")
+              output.write(f"has_break_glass={'true' if has_break_glass else 'false'}\n")
+              output.write(f"classified_head={classified_head if head_valid else ''}\n")
+              output.write(f"head_valid={'true' if head_valid else 'false'}\n")
+          PY
+          then
+            mark_unavailable
+          fi
+
+      - name: Find the break-glass label event
+        id: label_event
+        if: >-
+          steps.inspect.outputs.class_name == 'none' &&
+          steps.inspect.outputs.has_break_glass == 'true' &&
+          steps.inspect.outputs.head_valid == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+          EVENT_ACTOR: ${{ github.actor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          events_json="$RUNNER_TEMP/shipshape-pr-events.json"
+
+          deny_event() {
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "Not eligible: $1"
+            exit 0
+          }
+
+          if ! gh api --paginate --slurp \
+            "repos/$GH_REPO/issues/$PR_NUMBER/events?per_page=$API_PAGE_SIZE" \
+            > "$events_json"; then
+            deny_event "break-glass label history could not be read."
+          fi
+
+          if ! python3 - "$events_json" "$GITHUB_OUTPUT" \
+            "$EVENT_ACTION" "$EVENT_LABEL" "$EVENT_ACTOR" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+
+          def fail(message):
+              print(f"Not eligible: {message}")
+              raise SystemExit(1)
+
+
+          try:
+              payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              fail("break-glass label history was malformed.")
+          if not isinstance(payload, list) or not all(
+              isinstance(page, list) for page in payload
+          ):
+              fail("break-glass label history was incomplete.")
+          events = [item for page in payload for item in page]
+          if not all(isinstance(item, dict) for item in events):
+              fail("break-glass label history contained invalid records.")
+
+          matches = [
+              item
+              for item in events
+              if item.get("event") == "labeled"
+              and isinstance(item.get("label"), dict)
+              and item["label"].get("name") == "break-glass-automerge"
+          ]
+          label_event = max(matches, key=lambda item: int(item.get("id", 0)), default=None)
+          if label_event is None:
+              fail("the break-glass label event was not found.")
+
+          actor_data = label_event.get("actor")
+          label_actor = actor_data.get("login", "") if isinstance(actor_data, dict) else ""
+          label_timestamp = label_event.get("created_at", "")
+          label_event_id = str(label_event.get("id", ""))
+          if (
+              re.fullmatch(r"[A-Za-z0-9-]+(?:\[bot\])?", label_actor) is None
+              or re.fullmatch(r"[0-9T:.Z+-]+", label_timestamp or "") is None
+              or not label_event_id.isdigit()
+          ):
+              fail("the break-glass label event identity was invalid.")
+
+          if sys.argv[3] == "labeled" and sys.argv[4] == "break-glass-automerge":
+              if label_actor != sys.argv[5]:
+                  fail("the current label actor did not match the audit event.")
+
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write("found=true\n")
+              output.write(f"label_actor={label_actor}\n")
+              output.write(f"label_timestamp={label_timestamp}\n")
+              output.write(f"label_event_id={label_event_id}\n")
+          PY
+          then
+            deny_event "break-glass label history could not be verified."
+          fi
+
+      - name: Authorize and audit break-glass use
+        id: break_glass
+        if: steps.label_event.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CLASSIFIED_HEAD: ${{ steps.inspect.outputs.classified_head }}
+          LABEL_ACTOR: ${{ steps.label_event.outputs.label_actor }}
+          LABEL_TIMESTAMP: ${{ steps.label_event.outputs.label_timestamp }}
+          LABEL_EVENT_ID: ${{ steps.label_event.outputs.label_event_id }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+          EVENT_ACTOR: ${{ github.actor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          deny_break_glass() {
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+            echo "Not eligible: $1"
+            exit 0
+          }
+
+          permission_json="$RUNNER_TEMP/shipshape-label-actor-permission.json"
+          if ! gh api \
+            "repos/$GH_REPO/collaborators/$LABEL_ACTOR/permission" \
+            > "$permission_json"; then
+            deny_break_glass "break-glass label actor authority could not be verified."
+          fi
+          if ! python3 - "$permission_json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          try:
+              permission = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              raise SystemExit(1)
+          if not isinstance(permission, dict) or permission.get("permission") not in {
+              "admin",
+              "write",
+          }:
+              raise SystemExit(1)
+          PY
+          then
+            deny_break_glass "break-glass label actor is not a maintainer."
+          fi
+
+          comments_json="$RUNNER_TEMP/shipshape-pr-comments.json"
+          if ! gh api --paginate --slurp \
+            "repos/$GH_REPO/issues/$PR_NUMBER/comments?per_page=$API_PAGE_SIZE" \
+            > "$comments_json"; then
+            deny_break_glass "break-glass audit comments could not be read."
+          fi
+
+          marker="<!-- shipshape-break-glass:$LABEL_EVENT_ID:$CLASSIFIED_HEAD -->"
+          count_markers() {
+            python3 - "$comments_json" "$marker" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          try:
+              payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              raise SystemExit(1)
+          if not isinstance(payload, list) or not all(
+              isinstance(page, list) for page in payload
+          ):
+              raise SystemExit(1)
+          comments = [item for page in payload for item in page]
+          marker_count = sum(
+              1
+              for item in comments
+              if isinstance(item, dict)
+              and isinstance(item.get("user"), dict)
+              and item["user"].get("login") == "github-actions[bot]"
+              and sys.argv[2] in (item.get("body") or "")
+          )
+          if marker_count != 1 and marker_count != 0:
+              raise SystemExit(1)
+          print(marker_count)
+          PY
+          }
+
+          if ! marker_count="$(count_markers)"; then
+            deny_break_glass "break-glass audit comment state was invalid."
+          fi
+
+          if [ "$marker_count" = "0" ]; then
+            if [ "$EVENT_ACTION" != "labeled" ] || \
+              [ "$EVENT_LABEL" != "break-glass-automerge" ] || \
+              [ "$EVENT_ACTOR" != "$LABEL_ACTOR" ]; then
+              deny_break_glass \
+                "break-glass must be reapplied to the classified head."
+            fi
+            comment_body="$RUNNER_TEMP/shipshape-break-glass-comment.md"
+            {
+              printf '%s\n' "$marker"
+              printf '%s\n' "Break-glass auto-merge was used; class rules were bypassed."
+              printf '\n- Label applied by: @%s\n' "$LABEL_ACTOR"
+              printf -- '- Label applied at: %s\n' "$LABEL_TIMESTAMP"
+            } > "$comment_body"
+            if ! gh pr comment "$PR_NUMBER" --repo "$GH_REPO" \
+              --body-file "$comment_body"; then
+              deny_break_glass "the required break-glass audit comment could not be posted."
+            fi
+            if ! gh api --paginate --slurp \
+              "repos/$GH_REPO/issues/$PR_NUMBER/comments?per_page=$API_PAGE_SIZE" \
+              > "$comments_json"; then
+              deny_break_glass "the break-glass audit comment could not be verified."
+            fi
+            if ! marker_count="$(count_markers)" || [ "$marker_count" != "1" ]; then
+              deny_break_glass "exactly one break-glass audit comment was not present."
+            fi
+          fi
+
+          echo "authorized=true" >> "$GITHUB_OUTPUT"
+
+      - name: Enable auto-merge
+        if: >-
+          steps.inspect.outputs.class_name != 'none' ||
+          steps.break_glass.outputs.authorized == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CLASS_NAME: ${{ steps.inspect.outputs.class_name }}
+          CLASSIFIED_HEAD: ${{ steps.inspect.outputs.classified_head }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! recheck_head="$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" \
+            --json headRefOid --jq '.headRefOid // ""')"; then
+            echo "Not eligible: pull request head could not be rechecked."
+            exit 0
+          fi
+          if [ "$recheck_head" != "$CLASSIFIED_HEAD" ]; then
+            echo "Not eligible: pull request head changed after classification."
+            exit 0
+          fi
+
+          if [ "$CLASS_NAME" = "none" ]; then
+            echo "Eligible: authorized, audited break-glass bypass."
+          else
+            echo "Eligible: $CLASS_NAME. Auto-merge waits for every required check."
+          fi
+          if ! gh pr merge "$PR_NUMBER" --repo "$GH_REPO" \
+            --auto --squash --match-head-commit "$CLASSIFIED_HEAD"; then
+            echo "Auto-merge could not be enabled."
+            exit 0
+          fi
+
+      - name: Log ineligible pull request
+        if: >-
+          steps.inspect.outputs.class_name == 'none' &&
+          steps.break_glass.outputs.authorized != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CLASS_REASON: ${{ steps.inspect.outputs.class_reason }}
+        shell: bash
+        run: |
+          echo "Not eligible — $CLASS_REASON; no authorized break-glass bypass."
+
+          auto_merge_json="$RUNNER_TEMP/shipshape-auto-merge.json"
+          if ! gh pr view "$PR_NUMBER" --repo "$GH_REPO" \
+            --json autoMergeRequest,headRefOid > "$auto_merge_json"; then
+            echo "Could not inspect prior auto-merge state; no merge was enabled."
+            exit 0
+          fi
+          mapfile -t auto_state < <(python3 - "$auto_merge_json" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          try:
+              payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              raise SystemExit(1)
+          head = payload.get("headRefOid", "") if isinstance(payload, dict) else ""
+          request = payload.get("autoMergeRequest") if isinstance(payload, dict) else None
+          enabled = request.get("enabledBy") if isinstance(request, dict) else None
+          enabled_by = enabled.get("login", "") if isinstance(enabled, dict) else ""
+          if re.fullmatch(r"[0-9a-f]{40,64}", head) is None:
+              raise SystemExit(1)
+          workflow_owned = enabled_by == "github-actions[bot]"
+          print(head)
+          print("true" if workflow_owned else "false")
+          PY
+          )
+          if [ "${#auto_state[@]}" -ne 2 ]; then
+            echo "Could not verify prior auto-merge ownership; no merge was enabled."
+            exit 0
+          fi
+
+          current_head="${auto_state[0]}"
+          workflow_owned="${auto_state[1]}"
+          if [ "$workflow_owned" = "true" ]; then
+            if gh pr merge "$PR_NUMBER" --repo "$GH_REPO" --disable-auto \
+              --match-head-commit "$current_head"; then
+              echo "Removed workflow-owned auto-merge from the ineligible head."
+            else
+              echo "Could not remove workflow-owned auto-merge; no merge was enabled."
+            fi
+          fi

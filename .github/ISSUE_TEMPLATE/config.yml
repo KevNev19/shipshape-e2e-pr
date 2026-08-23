@@ -1,0 +1,4 @@
+# What this is: settings for GitHub's issue forms.
+# Safe to edit: yes — shipshape will ask before overwriting your edits.
+# managed-by: shipshape v0.2.1
+blank_issues_enabled: true

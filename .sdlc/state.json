@@ -1,0 +1,140 @@
+{
+  "files": {
+    ".github/CODEOWNERS": {
+      "kit_version": "0.2.1",
+      "sha256": "092a9934df2753947ecf4a6001a6a2bb851a3923310cc21332fdc587a3c67cda",
+      "template": "github/CODEOWNERS.tmpl"
+    },
+    ".github/ISSUE_TEMPLATE/bug.yml": {
+      "kit_version": "0.2.1",
+      "sha256": "6f4900b66d4f8617e9331dff87ffb11b4ed9152c7ec9d02d6cb251864aa41cd1",
+      "template": "github/ISSUE_TEMPLATE/bug.yml.tmpl"
+    },
+    ".github/ISSUE_TEMPLATE/config.yml": {
+      "kit_version": "0.2.1",
+      "sha256": "f22f2718f1774e8ad62b062333cac709789499e5651407376070b21543c3630e",
+      "template": "github/ISSUE_TEMPLATE/config.yml.tmpl"
+    },
+    ".github/ISSUE_TEMPLATE/task.yml": {
+      "kit_version": "0.2.1",
+      "sha256": "1a20e3d6948d3a3f9d4bd3f89d6d8a63cf98c4af05a648099527662e849b2e4f",
+      "template": "github/ISSUE_TEMPLATE/task.yml.tmpl"
+    },
+    ".github/PULL_REQUEST_TEMPLATE.md": {
+      "kit_version": "0.2.1",
+      "sha256": "d0ef421fa059db0aae2056ece8fce28ad497534d1a5ac60ea77bf6996ba4017b",
+      "template": "github/PULL_REQUEST_TEMPLATE.md.tmpl"
+    },
+    ".github/agents/reviewer.md": {
+      "kit_version": "0.2.1",
+      "sha256": "d587f9745e55f1c9cb1b636d40bb51e94451ce5e78b6bcf694d6fbb6ca3abcfb",
+      "template": "github/agents/reviewer.md.tmpl"
+    },
+    ".github/copilot-instructions.md": {
+      "kit_version": "0.2.1",
+      "sha256": "5b6815065944a692cc7c517d6ad17c2f0cf5e52de909b24cd4ebe233f402b138",
+      "template": "github/copilot-instructions.md.tmpl"
+    },
+    ".github/dependabot.yml": {
+      "kit_version": "0.2.1",
+      "sha256": "2dfe80798e6de1e7b0483a1267bb9ab966cc83ad595853a2b72f4491b9d2edf2",
+      "template": "github/dependabot.yml.tmpl"
+    },
+    ".github/workflows/ci.yml": {
+      "kit_version": "0.2.1",
+      "sha256": "43fe8b7cff76f66037d256cd59ca1a3f8e1d4dbe0830fa2af12453c9a4219a98",
+      "template": "github/workflows/ci-python.yml.tmpl"
+    },
+    ".github/workflows/codeql.yml": {
+      "kit_version": "0.2.1",
+      "sha256": "7ff0ca2caea8a65b86d448fdce4f683be9cc8a75addff67bb86569caeb152309",
+      "template": "github/workflows/codeql.yml.tmpl"
+    },
+    ".github/workflows/copilot-setup-steps.yml": {
+      "kit_version": "0.2.1",
+      "sha256": "e50f53c83479c8211c73da9fd2885acb609ac7eddf289f870354778e02e1c336",
+      "template": "github/workflows/copilot-setup-python.yml.tmpl"
+    },
+    ".github/workflows/low-risk-automerge.yml": {
+      "kit_version": "0.2.1",
+      "sha256": "4f4dcea751ef8ec391973aebc8eb04e1b36608519ac7c6db1b68966abac19683",
+      "template": "github/workflows/low-risk-automerge.yml.tmpl"
+    },
+    ".github/workflows/release.yml": {
+      "kit_version": "0.2.1",
+      "sha256": "a73226469fb45d26d6ebef6b84fbb0f940c77b463db0e622760bb0c5b5eb89a0",
+      "template": "github/workflows/release.yml.tmpl"
+    },
+    ".github/workflows/secret-scan.yml": {
+      "kit_version": "0.2.1",
+      "sha256": "c4bc1e0a4c1cf9470dd0b375a9b1b70c59f0d08fcdf3ac20aff7ebc906165df9",
+      "template": "github/workflows/secret-scan.yml.tmpl"
+    },
+    ".github/workflows/shipshape-doctor.yml": {
+      "kit_version": "0.2.1",
+      "sha256": "0828dc82c28c09b64f3a483f00919acef64da61cab550298886bbd271b9f4b86",
+      "template": "github/workflows/shipshape-doctor.yml.tmpl"
+    },
+    ".pre-commit-config.yaml": {
+      "kit_version": "0.2.1",
+      "sha256": "25254bbac172e4b286a6be0b0bb7091759daff31111f482a5aea3e4ed400f317",
+      "template": "precommit/pre-commit-config.yaml.tmpl"
+    },
+    ".sdlc/hooks/install.sh": {
+      "kit_version": "0.2.1",
+      "sha256": "4bfe0125ad30d50ec86c6eeebcf7ac2a0e6d0c8351cd37a049b11ad54baa1e98",
+      "template": "hooks/install.sh.tmpl"
+    },
+    ".sdlc/hooks/secret-guard.sh": {
+      "kit_version": "0.2.1",
+      "sha256": "7bf78912a8bee21e42645b747c51f8f7eb3d51138ec892b78e1d228550a17806",
+      "template": "hooks/secret-guard.sh.tmpl"
+    },
+    ".sdlc/scripts/doctor.py": {
+      "kit_version": "0.2.1",
+      "sha256": "c09de0d6cd9b2aa3c1670c8552cca901bd80ed8da6eabe2dfa4757f8a95760bb",
+      "template": "scripts/doctor.py.tmpl"
+    },
+    ".sdlc/templates/change-intent.md": {
+      "kit_version": "0.2.1",
+      "sha256": "4a9f239178ddda9f61a93b4272293a9d6657cd0e5d364ca32257430e39ab8b65",
+      "template": "docs/change-intent.md.tmpl"
+    },
+    "AGENTS.md": {
+      "kit_version": "0.2.1",
+      "sha256": "bcfd3da43b140c8d79a93660ace3b43912004b70722db5887532aec8b5ab5fd8",
+      "template": "adapters/AGENTS.md.tmpl"
+    },
+    "CLAUDE.md": {
+      "kit_version": "0.2.1",
+      "sha256": "2c45e81049a4a82fc6fb8b6515d8d3eed92082d2211392b23ffc5d8b683a8104",
+      "template": "adapters/CLAUDE.md.tmpl"
+    },
+    "SECURITY.md": {
+      "kit_version": "0.2.1",
+      "sha256": "e1c5e7ab9ed34b3bb32b4ed4c5f09c456fbe64c418b0c5929c0dd3df201483fe",
+      "template": "security/SECURITY.md.tmpl"
+    },
+    "docs/sdlc/design.md": {
+      "kit_version": "0.2.1",
+      "sha256": "f1e998dd42b94ad21d7168e8e84302ceb172407f950a83c77fb66774209562fe",
+      "template": "docs/design-doc.md.tmpl"
+    },
+    "docs/sdlc/glossary.md": {
+      "kit_version": "0.2.1",
+      "sha256": "a5a41486be70cc9c072cae82863dc1df213cd8e46c807fec1bd1f8faadc8e1df",
+      "template": "docs/glossary.md.tmpl"
+    },
+    "docs/sdlc/harness.md": {
+      "kit_version": "0.2.1",
+      "sha256": "6a53f2bc89eb00c3cac14fabf687bd156e3ddd7ca153e79c321642fe7c8b78c3",
+      "template": "harness/sdlc-harness.md.tmpl"
+    },
+    "docs/sdlc/security.md": {
+      "kit_version": "0.2.1",
+      "sha256": "24669f416f4c720ffb4f9077e638c998c1e1969839c45c65751aaef55885c271",
+      "template": "security/security-explainer.md.tmpl"
+    }
+  },
+  "kit_version": "0.2.1"
+}
