@@ -42,7 +42,7 @@
     },
     ".github/workflows/ci.yml": {
       "kit_version": "0.2.1",
-      "sha256": "43fe8b7cff76f66037d256cd59ca1a3f8e1d4dbe0830fa2af12453c9a4219a98",
+      "sha256": "92a5a2fb30f473bed611197953139d474c60582d795532a8082533c151dd4e07",
       "template": "github/workflows/ci-python.yml.tmpl"
     },
     ".github/workflows/codeql.yml": {
@@ -57,7 +57,7 @@
     },
     ".github/workflows/low-risk-automerge.yml": {
       "kit_version": "0.2.1",
-      "sha256": "4f4dcea751ef8ec391973aebc8eb04e1b36608519ac7c6db1b68966abac19683",
+      "sha256": "8255eab7b40e712221abf233c51995db9ad1846223cecfb209de9d7943fd50bb",
       "template": "github/workflows/low-risk-automerge.yml.tmpl"
     },
     ".github/workflows/release.yml": {
