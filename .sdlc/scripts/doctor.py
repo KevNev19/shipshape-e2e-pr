@@ -359,7 +359,7 @@ def secret_guard_is_skipped() -> bool:
     }
 
 
-def secret_guard_installation_check(repo: Path, features: dict, guard: Path) -> dict:
+def guard_installation_check(repo: Path, features: dict, guard: Path) -> dict:
     if not features.get("secret_guard", True):
         return check(
             "secret guard installed",
@@ -614,7 +614,7 @@ def security_checks(repo: Path, config: dict) -> list[dict]:
         )
 
     if guard.is_file():
-        checks.append(secret_guard_installation_check(repo, features, guard))
+        checks.append(guard_installation_check(repo, features, guard))
 
     checks.append(agent_control_coverage_check(repo, features))
     checks.append(tiered_review_gates_check(repo, config))
