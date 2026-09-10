@@ -1,5 +1,5 @@
-# What this is: turns a version tag (like v1.2.0) into a GitHub release with
-# human-readable notes, automatically. Cut releases with /shipshape-release.
+# What this is: publishes a version tag only after a trusted default-branch
+# helper proves the tag's exact commit passed every enabled release gate.
 # Safe to edit: yes — shipshape will ask before overwriting your edits.
 # managed-by: shipshape v0.2.1
 name: Release
@@ -8,18 +8,52 @@ on:
   push:
     tags: ["v*"]
 
-# This workflow needs to write (it creates the release itself).
+# Read workflow evidence and create only the verified GitHub release.
 permissions:
+  actions: read
   contents: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - name: Create GitHub release with generated notes
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+      - name: Load release policy from the trusted default branch
         env:
           GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          default_branch="$(
+            gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch
+          )"
+          policy_path=".sdlc/scripts/release-preflight.py"
+          helper="${RUNNER_TEMP}/release-preflight.py"
+          gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/contents/${policy_path}" \
+            -f "ref=${default_branch}" --jq .content \
+            | tr -d '\n' \
+            | base64 --decode >"${helper}"
+          chmod 700 "${helper}"
+
+      - name: Verify the exact tag and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          helper="${RUNNER_TEMP}/release-preflight.py"
+          if ! evidence="$(
+            python3 "${helper}" publish \
+              --repo "$GITHUB_REPOSITORY" \
+              --tag "$GITHUB_REF_NAME" \
+              --candidate "$GITHUB_SHA"
+          )"; then
+            printf '%s\n' "$evidence"
+            exit 1
+          fi
+          printf '%s\n' "$evidence"
+          candidate_sha="$(printf '%s' "$evidence" | python3 -c \
+            'import json,sys; print(json.load(sys.stdin)["candidate_sha"])')"
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$candidate_sha" \
+            --generate-notes \
+            --verify-tag

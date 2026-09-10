@@ -18,20 +18,29 @@ credential file, it blocks the commit and tells you why. This is your first
 line of defence, because a secret that reaches git history is very hard to
 truly delete.
 
+The guard also warns when automation or project-policy controls change and
+blocks a short list of executable JSON settings. It is a heuristic: legitimate
+control changes can trigger it, and an unrecognized secret or unsafe instruction
+can pass. Read the named files and the actual diff; a clean scan cannot
+guarantee safety.
+
 One-time setup per clone of this repo: `bash .sdlc/hooks/install.sh`
 
 ## 2. CI — on GitHub, after every push
 
-The automated checks in `.github/workflows/ci.yml` run the tests on every
-change. A red X on a commit means the tests failed — open the failed step,
-read the last lines, and fix (or ask your AI assistant to explain it).
+The automated checks in `.github/workflows/ci.yml` run the tests after a push
+(and before merge in pull-request workflows). A red X means a configured check
+failed — open the failed step, read the last lines, and fix it. Green means the
+configured checks passed for that commit; it does not prove the change is safe
+or that an unconfigured check ran.
 
 ## 3. Code scanning (CodeQL) — GitHub reads the code for you
 
 Where available, CodeQL scans the code on every push and weekly, looking
 for known-vulnerable patterns. Findings appear under the repository's
 **Security** tab. It is free on public repositories; private repositories
-need GitHub Advanced Security.
+need GitHub Advanced Security. If CodeQL is unavailable or expected but no
+applicable run exists, treat that result as unknown rather than clean.
 
 ## 4. Dependency watch (Dependabot) — the libraries you build on
 

@@ -1,140 +1,576 @@
 #!/usr/bin/env bash
 # What this is: a safety net that checks changes for secrets (passwords,
 # API keys, credential files) and risky agent/editor controls before they
-# can enter history. It runs two
-# ways: as a pre-commit hook on your computer (checks what you're about to
-# commit), and with --range A..B in CI (checks a pushed or proposed change,
-# including ones written by AI agents). If it blocks a commit, it tells you
-# why. To bypass in a genuine false alarm:
-#   git commit --no-verify
+# can enter history. As a pre-commit hook it scans the staged index. With
+# --range A..B it scans each commit introduced between A and B, so a secret
+# added and removed in separate commits is still found. If it blocks a local
+# commit, fix the finding or use git commit --no-verify for a reviewed false
+# alarm.
+# The structured control check is deliberately bounded to regular UTF-8
+# JSON/JSONC files under .claude, .agents, .codex, .vscode, and .devcontainer,
+# plus the named .zed and .fleet settings files below. It accepts line and
+# block comments and trailing commas, rejects duplicate keys or malformed
+# input, and compares complete staged or per-commit blobs for introduced or
+# changed command, hook, task, terminal, and encoded-string settings. Other
+# control formats are warning-only. This heuristic does not prove semantic
+# safety; every control-file change still needs review.
 # Safe to edit: yes, but keep all three layers — file, content, and control paths.
 # managed-by: shipshape v0.2.1
 set -u
 
-root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+inspection_error() {
+  echo "ERROR: secret guard could not inspect the requested Git changes." >&2
+  echo "  Check the revisions and repository state, then run the scan again." >&2
+  exit 2
+}
 
-# Mode: staged index (default, pre-commit) or a commit range (CI).
+usage_error() {
+  echo "usage: secret-guard.sh [--range A..B]" >&2
+  exit 2
+}
+
+if ! root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  inspection_error
+fi
+if ! cd "$root"; then
+  inspection_error
+fi
+
+mode="staged"
 range=""
-if [ "${1:-}" = "--range" ]; then
-  range="${2:?usage: secret-guard.sh [--range A..B]}"
+if [ "$#" -eq 2 ] && [ "$1" = "--range" ]; then
+  mode="range"
+  range="$2"
+elif [ "$#" -ne 0 ]; then
+  usage_error
 fi
-if [ -n "$range" ]; then
-  changed="$(git diff --name-only --diff-filter=ACM "$range")"
-  control_changed="$(git diff --name-only --no-renames --diff-filter=ACMTD "$range")"
-  diff_text() { git diff -U0 "$range"; }
-  added_lines() { git diff --no-renames -U0 "$range" -- "$1" | grep -E '^\+' | grep -vE '^\+\+\+' || true; }
-else
-  changed="$(git diff --cached --name-only --diff-filter=ACM)"
-  control_changed="$(git diff --cached --name-only --no-renames --diff-filter=ACMTD)"
-  diff_text() { git diff --cached -U0; }
-  added_lines() { git diff --cached --no-renames -U0 -- "$1" | grep -E '^\+' | grep -vE '^\+\+\+' || true; }
-fi
-[ -z "$changed" ] && [ -z "$control_changed" ] && exit 0
+
+task_tmp="$(mktemp -d "${TMPDIR:-/tmp}/shipshape-secret-guard.XXXXXX")" || inspection_error
+trap 'rm -rf "$task_tmp"' EXIT HUP INT TERM
+
 blocked=0
 secret_blocked=0
 control_blocked=0
-
-# Layer 1: whole files that should never enter history.
-while IFS= read -r f; do
-  case "$f" in
-    *.pem|*.key|*id_rsa*|*id_ed25519*|*.p12|*.pfx|.env|*/.env|.env.*|*credentials.json|*serviceaccount*.json)
-      echo "BLOCKED: '$f' looks like a credential or key file. Files like this" >&2
-      echo "  should stay out of git entirely (add it to .gitignore instead)." >&2
-      blocked=1
-      secret_blocked=1
-      ;;
-  esac
-done <<EOF
-$changed
-EOF
-
-# Layer 2: newly added lines that match well-known secret patterns.
+scan_number=0
 patterns='AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk_live_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{35}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
-matches="$(diff_text | grep -E '^\+' | grep -vE '^\+\+\+' | grep -cE "$patterns" || true)"
-if [ "${matches:-0}" -gt 0 ]; then
-  echo "BLOCKED: $matches added line(s) look like an API key, token, or private key." >&2
-  echo "  If this got committed, anyone with repo access could use it." >&2
-  echo "  Remove the secret and store it outside git (an ignored .env file)." >&2
-  blocked=1
-  secret_blocked=1
-fi
 
-# layer 3: agent control files
-control_files="$(printf '%s\n' "$control_changed" | grep -E '^(\.claude/|\.vscode/|\.github/agents/|\.github/copilot-instructions\.md$|AGENTS\.md$|CLAUDE\.md$|\.sdlc/hooks/)' || true)"
-if [ -n "$control_files" ]; then
-  echo "WARN: agent or editor control files changed:" >&2
-  while IFS= read -r f; do
-    printf '  - %s\n' "$f" >&2
-  done <<EOF
-$control_files
-EOF
-  echo "  These files change how automated tools behave in this repository." >&2
-  echo "  Review them as carefully as code." >&2
-fi
+extract_added_lines() {
+  local normalized_file="$2.normalized"
 
-while IFS= read -r f; do
-  case "$f" in
-    *.json|*.jsonc)
-      added="$(added_lines "$f")"
-      [ -z "$added" ] && continue
+  LC_ALL=C tr '\000' ' ' <"$1" >"$normalized_file" || return 1
+  LC_ALL=C awk '
+    /^diff --git / { in_hunk = 0; next }
+    /^@@ / { in_hunk = 1; next }
+    in_hunk && substr($0, 1, 1) == "+" { print }
+  ' "$normalized_file" >"$2"
+}
 
-      # Explicit command, hook, shell, or executable type settings.
-      execution_settings='"(command|hooks?)"[[:space:]]*:|"terminal\.integrated\.(shell|shellArgs|automationProfile)\.(linux|osx|windows)"[[:space:]]*:|"type"[[:space:]]*:[[:space:]]*"(command|process|shell)"'
-      execution_hits="$(printf '%s\n' "$added" | grep -cE "$execution_settings" || true)"
+count_ere_matches() {
+  local pattern="$1"
+  local input="$2"
+  local count status
 
-      # A modern VS Code terminal profile executes its added path and arguments.
-      profile_keys="$(printf '%s\n' "$added" | grep -cE '"terminal\.integrated\.profiles\.(linux|osx|windows)"[[:space:]]*:' || true)"
-      profile_values="$(printf '%s\n' "$added" | grep -cE '"(path|args)"[[:space:]]*:' || true)"
-      if [ "${profile_keys:-0}" -gt 0 ] && [ "${profile_values:-0}" -gt 0 ]; then
-        profile_hits=1
-      else
-        profile_hits=0
-      fi
+  count="$(LC_ALL=C grep -a -cE "$pattern" "$input")"
+  status=$?
+  case "$status" in
+    0|1) printf '%s\n' "${count:-0}" ;;
+    *) return "$status" ;;
+  esac
+}
 
-      # Arguments in VS Code task files extend a command invocation.
-      case "$f" in
-        .vscode/tasks.json|.vscode/tasks.jsonc)
-          task_hits="$(printf '%s\n' "$added" | grep -cE '"args"[[:space:]]*:' || true)"
-          ;;
-        *) task_hits=0 ;;
-      esac
+count_fixed_file_matches() {
+  local pattern_file="$1"
+  local input="$2"
+  local count status
 
-      if [ "${execution_hits:-0}" -gt 0 ] || [ "${profile_hits:-0}" -gt 0 ] || [ "${task_hits:-0}" -gt 0 ]; then
-        echo "BLOCKED: executable agent or editor settings were added to '$f'." >&2
-        echo "  Command, hook, task, and terminal settings can run code on your machine." >&2
-        blocked=1
-        control_blocked=1
-      fi
+  count="$(LC_ALL=C grep -a -cFf "$pattern_file" "$input")"
+  status=$?
+  case "$status" in
+    0|1) printf '%s\n' "${count:-0}" ;;
+    *) return "$status" ;;
+  esac
+}
 
-      # Long base64-looking strings can conceal encoded commands or payloads.
-      encoded_hits="$(printf '%s\n' "$added" | grep -cE '[A-Za-z0-9+/=]{40,}' || true)"
-      if [ "${encoded_hits:-0}" -gt 0 ]; then
-        echo "BLOCKED: a long base64-looking value was added to '$f'." >&2
-        echo "  Decode and review it before allowing automated tools to read it." >&2
-        blocked=1
-        control_blocked=1
-      fi
+write_scan_files() {
+  local diff_file="$1"
+  local changed_file="$2"
+  local control_file="$3"
+  local from_revision="${4:-}"
+  local to_revision="${5:-}"
+
+  if [ "$mode" = "staged" ]; then
+    git diff --cached --text --no-ext-diff --no-textconv --no-renames -U0 -- >"$diff_file" || return 1
+    git diff --cached --name-only -z --no-ext-diff --no-textconv --no-renames --diff-filter=ACM -- >"$changed_file" || return 1
+    git diff --cached --name-only -z --no-ext-diff --no-textconv --no-renames --diff-filter=ACMTD -- >"$control_file" || return 1
+  else
+    git diff --text --no-ext-diff --no-textconv --no-renames -U0 \
+      "$from_revision" "$to_revision" -- >"$diff_file" || return 1
+    git diff --name-only -z --no-ext-diff --no-textconv --no-renames --diff-filter=ACM \
+      "$from_revision" "$to_revision" -- >"$changed_file" || return 1
+    git diff --name-only -z --no-ext-diff --no-textconv --no-renames --diff-filter=ACMTD \
+      "$from_revision" "$to_revision" -- >"$control_file" || return 1
+  fi
+}
+
+is_control_file() {
+  case "$1" in
+    AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md|SKILL.md|*/SKILL.md|\
+    .claude/*|*/.claude/*|.agents/*|*/.agents/*|.codex/*|*/.codex/*|\
+    .claude-plugin/*|*/.claude-plugin/*|.codex-plugin/*|*/.codex-plugin/*|\
+    .github/agents/*|*/.github/agents/*|.github/copilot-instructions.md|*/.github/copilot-instructions.md|\
+    .github/workflows/*|*/.github/workflows/*|.sdlc/*|*/.sdlc/*|\
+    docs/agents/*|*/docs/agents/*|docs/sdlc/*|*/docs/sdlc/*|docs/harness.md|*/docs/harness.md|\
+    .vscode/*|*/.vscode/*|.idea/runConfigurations/*|*/.idea/runConfigurations/*|\
+    .zed/tasks.json|*/.zed/tasks.json|.zed/settings.json|*/.zed/settings.json|\
+    .fleet/run.json|*/.fleet/run.json|.devcontainer/*|*/.devcontainer/*)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+is_executable_json_settings_file() {
+  case "$1" in
+    .claude/*.json|*/.claude/*.json|.claude/*.jsonc|*/.claude/*.jsonc|\
+    .agents/*.json|*/.agents/*.json|.agents/*.jsonc|*/.agents/*.jsonc|\
+    .codex/*.json|*/.codex/*.json|.codex/*.jsonc|*/.codex/*.jsonc|\
+    .vscode/*.json|*/.vscode/*.json|.vscode/*.jsonc|*/.vscode/*.jsonc|\
+    .zed/tasks.json|*/.zed/tasks.json|.zed/settings.json|*/.zed/settings.json|\
+    .fleet/run.json|*/.fleet/run.json|\
+    .devcontainer/*.json|*/.devcontainer/*.json|.devcontainer/*.jsonc|*/.devcontainer/*.jsonc)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+write_index_blob() {
+  local path="$1"
+  local output="$2"
+  local metadata="$output.metadata"
+  local record header found_path mode object_id stage_number
+  local record_count=0
+
+  git ls-files --stage -z -- ":(literal)$path" >"$metadata" || return 1
+  while IFS= read -r -d '' record; do
+    record_count=$((record_count + 1))
+    [ "$record_count" -eq 1 ] || return 1
+    case "$record" in *$'\t'*) ;; *) return 1 ;; esac
+    header="${record%%$'\t'*}"
+    found_path="${record#*$'\t'}"
+    [ "$found_path" = "$path" ] || return 1
+    set -- $header
+    [ "$#" -eq 3 ] || return 1
+    mode="$1"
+    object_id="$2"
+    stage_number="$3"
+  done <"$metadata"
+  [ "$record_count" -eq 1 ] || return 3
+  case "$mode" in 100644|100755) ;; *) return 1 ;; esac
+  [ "$stage_number" = "0" ] || return 1
+  case "$object_id" in ""|*[!0-9a-f]*) return 1 ;; esac
+  git cat-file blob "$object_id" >"$output" || return 1
+}
+
+write_tree_blob() {
+  local revision="$1"
+  local path="$2"
+  local output="$3"
+  local metadata="$output.metadata"
+  local record header found_path mode object_type object_id
+  local record_count=0
+
+  git ls-tree -z "$revision" -- ":(literal)$path" >"$metadata" || return 1
+  while IFS= read -r -d '' record; do
+    record_count=$((record_count + 1))
+    [ "$record_count" -eq 1 ] || return 1
+    case "$record" in *$'\t'*) ;; *) return 1 ;; esac
+    header="${record%%$'\t'*}"
+    found_path="${record#*$'\t'}"
+    [ "$found_path" = "$path" ] || return 1
+    set -- $header
+    [ "$#" -eq 3 ] || return 1
+    mode="$1"
+    object_type="$2"
+    object_id="$3"
+  done <"$metadata"
+  [ "$record_count" -eq 1 ] || return 3
+  case "$mode" in 100644|100755) ;; *) return 1 ;; esac
+  [ "$object_type" = "blob" ] || return 1
+  case "$object_id" in ""|*[!0-9a-f]*) return 1 ;; esac
+  git cat-file blob "$object_id" >"$output" || return 1
+}
+
+inspect_json_settings() {
+  local old_blob="$1"
+  local new_blob="$2"
+  local path="$3"
+  local old_present="$4"
+  local parser_status
+
+  python3 - "$old_blob" "$new_blob" "$path" "$old_present" >/dev/null 2>&1 <<'PY'
+import collections
+import json
+import re
+import sys
+
+
+EXECUTABLE_KEYS = {"command", "hook", "hooks"}
+TERMINAL_KEYS = {
+    "terminal.integrated.shell.linux",
+    "terminal.integrated.shell.osx",
+    "terminal.integrated.shell.windows",
+    "terminal.integrated.shellArgs.linux",
+    "terminal.integrated.shellArgs.osx",
+    "terminal.integrated.shellArgs.windows",
+    "terminal.integrated.automationProfile.linux",
+    "terminal.integrated.automationProfile.osx",
+    "terminal.integrated.automationProfile.windows",
+}
+PROFILE_KEYS = {
+    "terminal.integrated.profiles.linux",
+    "terminal.integrated.profiles.osx",
+    "terminal.integrated.profiles.windows",
+}
+EXECUTABLE_TYPES = {"command", "process", "shell"}
+ENCODED_VALUE = re.compile(r"[A-Za-z0-9+/=]{40,}")
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def reject_constant(value):
+    raise ValueError("non-finite JSON number")
+
+
+def remove_comments(source):
+    output = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(source):
+        character = source[index]
+        if in_string:
+            output.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            index += 1
+            continue
+        if character == '"':
+            in_string = True
+            output.append(character)
+            index += 1
+            continue
+        if character == "/" and index + 1 < len(source):
+            marker = source[index + 1]
+            if marker == "/":
+                output.extend("  ")
+                index += 2
+                while index < len(source) and source[index] not in "\r\n":
+                    output.append(" ")
+                    index += 1
+                continue
+            if marker == "*":
+                output.extend("  ")
+                index += 2
+                while index + 1 < len(source) and source[index : index + 2] != "*/":
+                    output.append(source[index] if source[index] in "\r\n" else " ")
+                    index += 1
+                if index + 1 >= len(source):
+                    raise ValueError("unterminated JSONC comment")
+                output.extend("  ")
+                index += 2
+                continue
+        output.append(character)
+        index += 1
+    return "".join(output)
+
+
+def remove_trailing_commas(source):
+    output = list(source)
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(source):
+        character = source[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            index += 1
+            continue
+        if character == '"':
+            in_string = True
+        elif character == ",":
+            lookahead = index + 1
+            while lookahead < len(source) and source[lookahead].isspace():
+                lookahead += 1
+            if lookahead < len(source) and source[lookahead] in "]}":
+                output[index] = " "
+        index += 1
+    return "".join(output)
+
+
+def load_json(path):
+    with open(path, "rb") as handle:
+        source = handle.read().decode("utf-8-sig")
+    normalized = remove_trailing_commas(remove_comments(source))
+    return json.loads(
+        normalized,
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
+
+
+def fingerprint(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def findings(document, task_file):
+    found = []
+
+    def add(kind, path, value):
+        found.append((kind, tuple(path), fingerprint(value)))
+
+    def walk(value, path=(), in_terminal_profile=False):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = path + (key,)
+                if key in EXECUTABLE_KEYS:
+                    add("executable", child_path, child)
+                if key in TERMINAL_KEYS:
+                    add("executable", child_path, child)
+                if key == "type" and child in EXECUTABLE_TYPES:
+                    add("executable", child_path, child)
+                if task_file and key == "args":
+                    add("executable", child_path, child)
+                child_in_profile = in_terminal_profile or key in PROFILE_KEYS
+                if in_terminal_profile and key in {"path", "args"}:
+                    add("executable", child_path, child)
+                walk(child, child_path, child_in_profile)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, path + ("[]",), in_terminal_profile)
+        elif isinstance(value, str) and ENCODED_VALUE.search(value):
+            add("encoded", path, value)
+
+    walk(document)
+    return collections.Counter(found)
+
+
+def main():
+    old_path, new_path, control_path, old_present = sys.argv[1:]
+    new_document = load_json(new_path)
+    old_document = load_json(old_path) if old_present == "1" else None
+    task_file = control_path.endswith(("/.vscode/tasks.json", "/.vscode/tasks.jsonc"))
+    task_file = task_file or control_path in {".vscode/tasks.json", ".vscode/tasks.jsonc"}
+    old_findings = findings(old_document, task_file) if old_document is not None else collections.Counter()
+    introduced = findings(new_document, task_file) - old_findings
+    kinds = {finding[0] for finding in introduced}
+    if kinds == {"executable"}:
+        return 10
+    if kinds == {"encoded"}:
+        return 11
+    if kinds:
+        return 12
+    return 0
+
+
+try:
+    sys.exit(main())
+except Exception:
+    sys.exit(2)
+PY
+  parser_status=$?
+  case "$parser_status" in
+    0) return 0 ;;
+    10|11|12) ;;
+    *) return 1 ;;
+  esac
+
+  case "$parser_status" in
+    10|12)
+      printf "BLOCKED: executable agent or editor settings changed in '%s'.\n" "$path" >&2
+      echo "  Command, hook, task, and terminal settings can run code on your machine." >&2
+      blocked=1
+      control_blocked=1
       ;;
   esac
-done <<EOF
-$control_files
-EOF
+  case "$parser_status" in
+    11|12)
+      printf "BLOCKED: a long base64-looking value changed in '%s'.\n" "$path" >&2
+      echo "  Decode and review it before allowing automated tools to read it." >&2
+      blocked=1
+      control_blocked=1
+      ;;
+  esac
+}
 
-# Optional extra denylist: one string per line in .sdlc/hooks/denylist.txt
-# (keep that file out of git — it may itself contain sensitive words).
-denylist="$root/.sdlc/hooks/denylist.txt"
-if [ -f "$denylist" ]; then
-  hits="$(diff_text | grep -E '^\+' | grep -vE '^\+\+\+' | grep -cFf "$denylist" || true)"
-  if [ "${hits:-0}" -gt 0 ]; then
-    echo "BLOCKED: $hits added line(s) match your private denylist." >&2
+scan_control_file() {
+  local path="$1"
+  local from_revision="${2:-}"
+  local to_revision="${3:-}"
+  local old_blob="$task_tmp/control-$scan_number.old"
+  local new_blob="$task_tmp/control-$scan_number.new"
+  local blob_status old_present=0 head_commit head_ref
+  scan_number=$((scan_number + 1))
+
+  is_executable_json_settings_file "$path" || return 0
+  if [ "$mode" = "staged" ]; then
+    write_index_blob "$path" "$new_blob"
+    blob_status=$?
+  else
+    write_tree_blob "$to_revision" "$path" "$new_blob"
+    blob_status=$?
+  fi
+  case "$blob_status" in
+    0) ;;
+    3) return 0 ;;
+    *) return 1 ;;
+  esac
+
+  if [ "$mode" = "staged" ]; then
+    if head_commit="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)"; then
+      write_tree_blob "$head_commit" "$path" "$old_blob"
+      blob_status=$?
+    else
+      head_ref="$(git symbolic-ref -q HEAD 2>/dev/null)" || return 1
+      git show-ref --verify --quiet "$head_ref"
+      blob_status=$?
+      case "$blob_status" in
+        1) blob_status=3 ;;
+        *) return 1 ;;
+      esac
+    fi
+  else
+    write_tree_blob "$from_revision" "$path" "$old_blob"
+    blob_status=$?
+  fi
+  case "$blob_status" in
+    0) old_present=1 ;;
+    3) ;;
+    *) return 1 ;;
+  esac
+
+  inspect_json_settings "$old_blob" "$new_blob" "$path" "$old_present"
+}
+
+scan_unit() {
+  local unit="$1"
+  local from_revision="${2:-}"
+  local to_revision="${3:-}"
+  local diff_file="$task_tmp/$unit.diff"
+  local added_file="$task_tmp/$unit.added"
+  local changed_file="$task_tmp/$unit.changed"
+  local control_file="$task_tmp/$unit.control"
+  local path matches warned denylist denylist_hits
+
+  write_scan_files \
+    "$diff_file" "$changed_file" "$control_file" "$from_revision" "$to_revision" || return 1
+  extract_added_lines "$diff_file" "$added_file" || return 1
+
+  # Layer 1: whole files that should never enter history. NUL delimiters keep
+  # spaces, tabs, newlines, and leading dashes inside the filename.
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      *.pem|*.key|*id_rsa*|*id_ed25519*|*.p12|*.pfx|.env|*/.env|.env.*|*/.env.*|*credentials.json|*serviceaccount*.json)
+        printf "BLOCKED: '%s' looks like a credential or key file. Files like this\n" "$path" >&2
+        echo "  should stay out of git entirely (add it to .gitignore instead)." >&2
+        blocked=1
+        secret_blocked=1
+        ;;
+    esac
+  done <"$changed_file"
+
+  # Layer 2: newly added lines that match high-confidence secret patterns.
+  matches="$(count_ere_matches "$patterns" "$added_file")" || return 1
+  if [ "${matches:-0}" -gt 0 ]; then
+    echo "BLOCKED: $matches added line(s) look like an API key, token, or private key." >&2
+    echo "  If this got committed, anyone with repo access could use it." >&2
+    echo "  Remove the secret and store it outside git (an ignored .env file)." >&2
     blocked=1
     secret_blocked=1
   fi
+
+  # Layer 3: automation and policy control files. Each file is diffed independently
+  # so executable JSON settings are attributed without exposing their content.
+  warned=0
+  while IFS= read -r -d '' path; do
+    if is_control_file "$path"; then
+      if [ "$warned" -eq 0 ]; then
+        echo "WARN: automation or policy control files changed:" >&2
+        warned=1
+      fi
+      printf '  - %s\n' "$path" >&2
+      scan_control_file "$path" "$from_revision" "$to_revision" || return 1
+    fi
+  done <"$control_file"
+  if [ "$warned" -eq 1 ]; then
+    echo "  These files change how automated tools behave or define project policy." >&2
+    echo "  Review them as carefully as code." >&2
+  fi
+
+  denylist="$root/.sdlc/hooks/denylist.txt"
+  if [ -f "$denylist" ]; then
+    denylist_hits="$(count_fixed_file_matches "$denylist" "$added_file")" || return 1
+    if [ "${denylist_hits:-0}" -gt 0 ]; then
+      echo "BLOCKED: $denylist_hits added line(s) match your private denylist." >&2
+      blocked=1
+      secret_blocked=1
+    fi
+  fi
+}
+
+if [ "$mode" = "staged" ]; then
+  scan_unit staged || inspection_error
+else
+  case "$range" in
+    *...*|-*|*..*..*|..*|*..)
+      inspection_error
+      ;;
+    *..*) ;;
+    *) usage_error ;;
+  esac
+  base_revision="${range%%..*}"
+  tip_revision="${range#*..}"
+  case "$base_revision" in ""|-*) inspection_error ;; esac
+  case "$tip_revision" in ""|-*) inspection_error ;; esac
+
+  base_commit="$(git rev-parse --verify "$base_revision^{commit}" 2>/dev/null)" || inspection_error
+  tip_commit="$(git rev-parse --verify "$tip_revision^{commit}" 2>/dev/null)" || inspection_error
+  commits_file="$task_tmp/commits"
+  git rev-list --reverse "$base_commit..$tip_commit" -- >"$commits_file" 2>/dev/null || inspection_error
+  empty_tree="$(git hash-object -t tree /dev/null 2>/dev/null)" || inspection_error
+
+  commit_number=0
+  while IFS= read -r commit; do
+    [ -z "$commit" ] && continue
+    commit_line="$(git rev-list --parents -n 1 "$commit" -- 2>/dev/null)" || inspection_error
+    set -- $commit_line
+    commit_hash="$1"
+    shift
+    parent_commit="${1:-$empty_tree}"
+    scan_unit "commit-$commit_number" "$parent_commit" "$commit_hash" || inspection_error
+    commit_number=$((commit_number + 1))
+  done <"$commits_file"
 fi
 
 if [ "$blocked" -eq 1 ]; then
   echo "" >&2
-  if [ -n "$range" ]; then
+  if [ "$mode" = "range" ]; then
     if [ "$control_blocked" -eq 1 ]; then
       echo "This change adds executable agent or editor settings. Review and" >&2
       echo "remove them before merging unless they are clearly intended." >&2
