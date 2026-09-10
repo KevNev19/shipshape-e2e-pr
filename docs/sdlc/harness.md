@@ -24,14 +24,18 @@ mirrored only by reference, not rewritten differently.
 
 - Run the tests with: `pytest`
 - The same checks run automatically on GitHub every time code is pushed
-  (see `.github/workflows/ci.yml`). A green check means the change is safe;
-  a red X means something broke — open the failed step to see what.
+  (see `.github/workflows/ci.yml`). In trunk style this is after landing; in PR
+  style required checks can run before merge. Green means the configured checks
+  passed for that exact commit, not that the change is safe or every relevant
+  check ran. A red X is a stop sign — open the failed step to see what broke.
 
 ## Security
 
 Security guardrails are not optional in this project. The full picture —
 what protects you, from what — lives in `docs/sdlc/security.md` once security
-setup has run. Never commit passwords, API keys, or personal data.
+setup has run. Never commit passwords, API keys, or personal data. Secret and
+control scans are heuristic: they can raise false alarms and cannot guarantee
+detection, so inspect the diff and resolve every warning.
 
 ## Reviews
 
@@ -39,11 +43,20 @@ Before accepting a change, understand what it does and what could break.
 If an AI assistant made the change, it must explain the change in plain
 language and say honestly whether tests passed.
 
+Code, dependencies, legal/governance/process/security material, automation or
+agent/editor/plugin controls, workflows, configuration, skills, harnesses, and
+uncertain paths require human review. If tiered review is explicitly enabled in
+a PR-style repository, only ordinary documentation outside those classes can
+be merged automatically, and only through current-head checks plus strict
+server enforcement. There is no automatic break-glass approval.
+
 ## Releases
 
 A release is a named, tagged version of the project that others can rely on.
 Releases are cut deliberately (not on every change), come with human-readable
-notes on what changed, and only from a green main branch.
+notes on what changed, and bind the exact candidate to default-branch ancestry
+and the successful latest run of every named applicable workflow. A generally
+green branch or an older successful run is not enough.
 
 ## For AI assistants
 

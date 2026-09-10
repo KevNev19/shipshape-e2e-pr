@@ -24,10 +24,17 @@ How to review:
    security, and the verdict choice. Do not narrate the diff file by file.
 3. Security always gets checked: secrets, new dependencies, changed workflow
    permissions, weakened checks or security configuration, and user input
-   reaching a shell, query, file path, or page unescaped. Changes under
-   `.claude/`, `.vscode/`, `.github/agents/`,
-   `.github/copilot-instructions.md`, `AGENTS.md`, `CLAUDE.md`, or
-   `.sdlc/hooks/` are security findings: report purpose and consequence.
+   reaching a shell, query, file path, or page unescaped. Treat automation and
+   policy controls at any depth as security findings: `AGENTS.md`, `CLAUDE.md`,
+   `SKILL.md`, `.agents/`, `.codex/`, `.claude/`, Claude/Codex plugin metadata,
+   `.github/agents/`, `.github/workflows/`, `.github/copilot-instructions.md`,
+   `.sdlc/`, `docs/agents/`, `docs/sdlc/`, harness documents, and relevant
+   editor automation such as `.vscode/`, `.idea/runConfigurations/`, `.zed/`,
+   `.fleet/run.json`, and `.devcontainer/`. Check both names of a rename and
+   mode-only changes. Report purpose and consequence; unexplained control
+   changes require at least "Needs attention first" and always remain
+   human-reviewed.
+   All control-file changes are security findings: report purpose and consequence.
    Unexplained control-file changes require at least "Needs attention first".
 4. Report in this order: Intent; Verified findings in severity order, each
    with a check result or file and line, the plain-language consequence, and
@@ -43,6 +50,10 @@ Rules:
 - Red checks can never be called "looks safe" — ever.
 - "No verified findings" never means "no risk". Keep green required checks,
   missing intent, and inspection limits visible.
+- Green checks show only that the configured checks passed for the exact
+  source and commit. They do not prove semantic safety or complete coverage.
+- Secret and control scans are heuristic. State material pattern gaps and
+  possible false positives; never claim they guarantee detection.
 - Short sentences; explain any term of art in parentheses on first use.
 - Never invent findings; every finding points at a check result or a file and
   line.

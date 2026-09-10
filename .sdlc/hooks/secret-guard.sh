@@ -6,6 +6,14 @@
 # added and removed in separate commits is still found. If it blocks a local
 # commit, fix the finding or use git commit --no-verify for a reviewed false
 # alarm.
+# The structured control check is deliberately bounded to regular UTF-8
+# JSON/JSONC files under .claude, .agents, .codex, .vscode, and .devcontainer,
+# plus the named .zed and .fleet settings files below. It accepts line and
+# block comments and trailing commas, rejects duplicate keys or malformed
+# input, and compares complete staged or per-commit blobs for introduced or
+# changed command, hook, task, terminal, and encoded-string settings. Other
+# control formats are warning-only. This heuristic does not prove semantic
+# safety; every control-file change still needs review.
 # Safe to edit: yes, but keep all three layers — file, content, and control paths.
 # managed-by: shipshape v0.2.1
 set -u
@@ -104,20 +112,6 @@ write_scan_files() {
   fi
 }
 
-write_file_diff() {
-  local output="$1"
-  local path="$2"
-  local from_revision="${3:-}"
-  local to_revision="${4:-}"
-
-  if [ "$mode" = "staged" ]; then
-    git diff --cached --text --no-ext-diff --no-textconv --no-renames -U0 -- "$path" >"$output"
-  else
-    git diff --text --no-ext-diff --no-textconv --no-renames -U0 \
-      "$from_revision" "$to_revision" -- "$path" >"$output"
-  fi
-}
-
 is_control_file() {
   case "$1" in
     AGENTS.md|*/AGENTS.md|CLAUDE.md|*/CLAUDE.md|SKILL.md|*/SKILL.md|\
@@ -150,54 +144,328 @@ is_executable_json_settings_file() {
   esac
 }
 
+write_index_blob() {
+  local path="$1"
+  local output="$2"
+  local metadata="$output.metadata"
+  local record header found_path mode object_id stage_number
+  local record_count=0
+
+  git ls-files --stage -z -- ":(literal)$path" >"$metadata" || return 1
+  while IFS= read -r -d '' record; do
+    record_count=$((record_count + 1))
+    [ "$record_count" -eq 1 ] || return 1
+    case "$record" in *$'\t'*) ;; *) return 1 ;; esac
+    header="${record%%$'\t'*}"
+    found_path="${record#*$'\t'}"
+    [ "$found_path" = "$path" ] || return 1
+    set -- $header
+    [ "$#" -eq 3 ] || return 1
+    mode="$1"
+    object_id="$2"
+    stage_number="$3"
+  done <"$metadata"
+  [ "$record_count" -eq 1 ] || return 3
+  case "$mode" in 100644|100755) ;; *) return 1 ;; esac
+  [ "$stage_number" = "0" ] || return 1
+  case "$object_id" in ""|*[!0-9a-f]*) return 1 ;; esac
+  git cat-file blob "$object_id" >"$output" || return 1
+}
+
+write_tree_blob() {
+  local revision="$1"
+  local path="$2"
+  local output="$3"
+  local metadata="$output.metadata"
+  local record header found_path mode object_type object_id
+  local record_count=0
+
+  git ls-tree -z "$revision" -- ":(literal)$path" >"$metadata" || return 1
+  while IFS= read -r -d '' record; do
+    record_count=$((record_count + 1))
+    [ "$record_count" -eq 1 ] || return 1
+    case "$record" in *$'\t'*) ;; *) return 1 ;; esac
+    header="${record%%$'\t'*}"
+    found_path="${record#*$'\t'}"
+    [ "$found_path" = "$path" ] || return 1
+    set -- $header
+    [ "$#" -eq 3 ] || return 1
+    mode="$1"
+    object_type="$2"
+    object_id="$3"
+  done <"$metadata"
+  [ "$record_count" -eq 1 ] || return 3
+  case "$mode" in 100644|100755) ;; *) return 1 ;; esac
+  [ "$object_type" = "blob" ] || return 1
+  case "$object_id" in ""|*[!0-9a-f]*) return 1 ;; esac
+  git cat-file blob "$object_id" >"$output" || return 1
+}
+
+inspect_json_settings() {
+  local old_blob="$1"
+  local new_blob="$2"
+  local path="$3"
+  local old_present="$4"
+  local parser_status
+
+  python3 - "$old_blob" "$new_blob" "$path" "$old_present" >/dev/null 2>&1 <<'PY'
+import collections
+import json
+import re
+import sys
+
+
+EXECUTABLE_KEYS = {"command", "hook", "hooks"}
+TERMINAL_KEYS = {
+    "terminal.integrated.shell.linux",
+    "terminal.integrated.shell.osx",
+    "terminal.integrated.shell.windows",
+    "terminal.integrated.shellArgs.linux",
+    "terminal.integrated.shellArgs.osx",
+    "terminal.integrated.shellArgs.windows",
+    "terminal.integrated.automationProfile.linux",
+    "terminal.integrated.automationProfile.osx",
+    "terminal.integrated.automationProfile.windows",
+}
+PROFILE_KEYS = {
+    "terminal.integrated.profiles.linux",
+    "terminal.integrated.profiles.osx",
+    "terminal.integrated.profiles.windows",
+}
+EXECUTABLE_TYPES = {"command", "process", "shell"}
+ENCODED_VALUE = re.compile(r"[A-Za-z0-9+/=]{40,}")
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def reject_constant(value):
+    raise ValueError("non-finite JSON number")
+
+
+def remove_comments(source):
+    output = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(source):
+        character = source[index]
+        if in_string:
+            output.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            index += 1
+            continue
+        if character == '"':
+            in_string = True
+            output.append(character)
+            index += 1
+            continue
+        if character == "/" and index + 1 < len(source):
+            marker = source[index + 1]
+            if marker == "/":
+                output.extend("  ")
+                index += 2
+                while index < len(source) and source[index] not in "\r\n":
+                    output.append(" ")
+                    index += 1
+                continue
+            if marker == "*":
+                output.extend("  ")
+                index += 2
+                while index + 1 < len(source) and source[index : index + 2] != "*/":
+                    output.append(source[index] if source[index] in "\r\n" else " ")
+                    index += 1
+                if index + 1 >= len(source):
+                    raise ValueError("unterminated JSONC comment")
+                output.extend("  ")
+                index += 2
+                continue
+        output.append(character)
+        index += 1
+    return "".join(output)
+
+
+def remove_trailing_commas(source):
+    output = list(source)
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(source):
+        character = source[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            index += 1
+            continue
+        if character == '"':
+            in_string = True
+        elif character == ",":
+            lookahead = index + 1
+            while lookahead < len(source) and source[lookahead].isspace():
+                lookahead += 1
+            if lookahead < len(source) and source[lookahead] in "]}":
+                output[index] = " "
+        index += 1
+    return "".join(output)
+
+
+def load_json(path):
+    with open(path, "rb") as handle:
+        source = handle.read().decode("utf-8-sig")
+    normalized = remove_trailing_commas(remove_comments(source))
+    return json.loads(
+        normalized,
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
+
+
+def fingerprint(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def findings(document, task_file):
+    found = []
+
+    def add(kind, path, value):
+        found.append((kind, tuple(path), fingerprint(value)))
+
+    def walk(value, path=(), in_terminal_profile=False):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = path + (key,)
+                if key in EXECUTABLE_KEYS:
+                    add("executable", child_path, child)
+                if key in TERMINAL_KEYS:
+                    add("executable", child_path, child)
+                if key == "type" and child in EXECUTABLE_TYPES:
+                    add("executable", child_path, child)
+                if task_file and key == "args":
+                    add("executable", child_path, child)
+                child_in_profile = in_terminal_profile or key in PROFILE_KEYS
+                if in_terminal_profile and key in {"path", "args"}:
+                    add("executable", child_path, child)
+                walk(child, child_path, child_in_profile)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, path + ("[]",), in_terminal_profile)
+        elif isinstance(value, str) and ENCODED_VALUE.search(value):
+            add("encoded", path, value)
+
+    walk(document)
+    return collections.Counter(found)
+
+
+def main():
+    old_path, new_path, control_path, old_present = sys.argv[1:]
+    new_document = load_json(new_path)
+    old_document = load_json(old_path) if old_present == "1" else None
+    task_file = control_path.endswith(("/.vscode/tasks.json", "/.vscode/tasks.jsonc"))
+    task_file = task_file or control_path in {".vscode/tasks.json", ".vscode/tasks.jsonc"}
+    old_findings = findings(old_document, task_file) if old_document is not None else collections.Counter()
+    introduced = findings(new_document, task_file) - old_findings
+    kinds = {finding[0] for finding in introduced}
+    if kinds == {"executable"}:
+        return 10
+    if kinds == {"encoded"}:
+        return 11
+    if kinds:
+        return 12
+    return 0
+
+
+try:
+    sys.exit(main())
+except Exception:
+    sys.exit(2)
+PY
+  parser_status=$?
+  case "$parser_status" in
+    0) return 0 ;;
+    10|11|12) ;;
+    *) return 1 ;;
+  esac
+
+  case "$parser_status" in
+    10|12)
+      printf "BLOCKED: executable agent or editor settings changed in '%s'.\n" "$path" >&2
+      echo "  Command, hook, task, and terminal settings can run code on your machine." >&2
+      blocked=1
+      control_blocked=1
+      ;;
+  esac
+  case "$parser_status" in
+    11|12)
+      printf "BLOCKED: a long base64-looking value changed in '%s'.\n" "$path" >&2
+      echo "  Decode and review it before allowing automated tools to read it." >&2
+      blocked=1
+      control_blocked=1
+      ;;
+  esac
+}
+
 scan_control_file() {
   local path="$1"
   local from_revision="${2:-}"
   local to_revision="${3:-}"
-  local raw_file="$task_tmp/control-$scan_number.diff"
-  local added_file="$task_tmp/control-$scan_number.added"
-  local execution_settings execution_hits profile_keys profile_values profile_hits
-  local task_hits encoded_hits
+  local old_blob="$task_tmp/control-$scan_number.old"
+  local new_blob="$task_tmp/control-$scan_number.new"
+  local blob_status old_present=0 head_commit head_ref
   scan_number=$((scan_number + 1))
 
-  write_file_diff "$raw_file" "$path" "$from_revision" "$to_revision" || return 1
-  extract_added_lines "$raw_file" "$added_file" || return 1
-  [ ! -s "$added_file" ] && return 0
-
-  if is_executable_json_settings_file "$path"; then
-    execution_settings='"(command|hooks?)"[[:space:]]*:|"terminal\.integrated\.(shell|shellArgs|automationProfile)\.(linux|osx|windows)"[[:space:]]*:|"type"[[:space:]]*:[[:space:]]*"(command|process|shell)"'
-    execution_hits="$(count_ere_matches "$execution_settings" "$added_file")" || return 1
-
-    profile_keys="$(count_ere_matches '"terminal\.integrated\.profiles\.(linux|osx|windows)"[[:space:]]*:' "$added_file")" || return 1
-    profile_values="$(count_ere_matches '"(path|args)"[[:space:]]*:' "$added_file")" || return 1
-    if [ "${profile_keys:-0}" -gt 0 ] && [ "${profile_values:-0}" -gt 0 ]; then
-      profile_hits=1
-    else
-      profile_hits=0
-    fi
-
-    case "$path" in
-      .vscode/tasks.json|*/.vscode/tasks.json|.vscode/tasks.jsonc|*/.vscode/tasks.jsonc)
-        task_hits="$(count_ere_matches '"args"[[:space:]]*:' "$added_file")" || return 1
-        ;;
-      *) task_hits=0 ;;
-    esac
-
-    if [ "${execution_hits:-0}" -gt 0 ] || [ "$profile_hits" -gt 0 ] || [ "${task_hits:-0}" -gt 0 ]; then
-      printf "BLOCKED: executable agent or editor settings were added to '%s'.\n" "$path" >&2
-      echo "  Command, hook, task, and terminal settings can run code on your machine." >&2
-      blocked=1
-      control_blocked=1
-    fi
-
-    encoded_hits="$(count_ere_matches '[A-Za-z0-9+/=]{40,}' "$added_file")" || return 1
-    if [ "${encoded_hits:-0}" -gt 0 ]; then
-      printf "BLOCKED: a long base64-looking value was added to '%s'.\n" "$path" >&2
-      echo "  Decode and review it before allowing automated tools to read it." >&2
-      blocked=1
-      control_blocked=1
-    fi
+  is_executable_json_settings_file "$path" || return 0
+  if [ "$mode" = "staged" ]; then
+    write_index_blob "$path" "$new_blob"
+    blob_status=$?
+  else
+    write_tree_blob "$to_revision" "$path" "$new_blob"
+    blob_status=$?
   fi
+  case "$blob_status" in
+    0) ;;
+    3) return 0 ;;
+    *) return 1 ;;
+  esac
+
+  if [ "$mode" = "staged" ]; then
+    if head_commit="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)"; then
+      write_tree_blob "$head_commit" "$path" "$old_blob"
+      blob_status=$?
+    else
+      head_ref="$(git symbolic-ref -q HEAD 2>/dev/null)" || return 1
+      git show-ref --verify --quiet "$head_ref"
+      blob_status=$?
+      case "$blob_status" in
+        1) blob_status=3 ;;
+        *) return 1 ;;
+      esac
+    fi
+  else
+    write_tree_blob "$from_revision" "$path" "$old_blob"
+    blob_status=$?
+  fi
+  case "$blob_status" in
+    0) old_present=1 ;;
+    3) ;;
+    *) return 1 ;;
+  esac
+
+  inspect_json_settings "$old_blob" "$new_blob" "$path" "$old_present"
 }
 
 scan_unit() {

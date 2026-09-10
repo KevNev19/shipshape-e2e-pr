@@ -21,10 +21,14 @@ Inspect behaviour, what else could be affected, security, and the verdict
 choice. If tests were changed to pass, say whether that looks legitimate (the
 correct answer changed) or suspicious (a check was weakened). Security always
 gets checked: secrets, new dependencies, changed workflow permissions,
-disabled checks, security configuration, and unescaped user input. Changes
-under `.claude/`, `.vscode/`, `.github/agents/`,
-`.github/copilot-instructions.md`, `AGENTS.md`, `CLAUDE.md`, or `.sdlc/hooks/`
-are security findings: report purpose and consequence. Unexplained control-file changes require at least "Needs attention first".
+disabled checks, security configuration, and unescaped user input. Treat nested
+instruction files and native agent, plugin, skill, workflow, policy, harness,
+and editor controls as security findings: report purpose and consequence. The
+guard structurally inspects supported JSON/JSONC settings for introduced or
+changed command, hook, task, terminal, and encoded values. Generic prose,
+ordinary state, and plugin-manifest hashes remain review signals, not semantic
+security verdicts; a clean scan does not prove safety or complete detection.
+Unexplained control-file changes require at least "Needs attention first".
 
 Report in this order:
 

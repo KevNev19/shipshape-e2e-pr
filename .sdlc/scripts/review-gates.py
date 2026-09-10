@@ -22,12 +22,15 @@ import subprocess
 import sys
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime
 
 API_PAGE_SIZE = 100
 MAX_ITEMS = 3000
 GITHUB_ACTIONS_APP_ID = 15368
 CODEQL_APP_ID = 57789
 RULESET_NAME = "Shipshape automatic merge safety"
+BASELINE_RULESET_NAME = "Shipshape branch protection"
+TRUNK_RULE_TYPES = ("deletion", "non_fast_forward")
 CONFIG_PATH = ".sdlc/config.json"
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -38,12 +41,18 @@ ROOT_DOCUMENTS = {
     "CHANGELOG.md",
     "README.md",
 }
+# Fixed support boundary: root README/changelog files and prose below
+# docs/guides/. Paths only bound automatic authority; they do not prove content
+# semantics. Every other documentation location requires human review.
+ORDINARY_DOCUMENT_PREFIXES = ("docs/guides/",)
 DOCUMENT_SUFFIXES = {".adoc", ".asciidoc", ".markdown", ".md", ".rst", ".txt"}
 SENSITIVE_WORDS = {
     "adr",
     "adrs",
     "agent",
     "agents",
+    "architecture",
+    "architectures",
     "compliance",
     "conduct",
     "contributing",
@@ -53,6 +62,8 @@ SENSITIVE_WORDS = {
     "decision",
     "decisions",
     "governance",
+    "guideline",
+    "guidelines",
     "harness",
     "legal",
     "licence",
@@ -67,6 +78,10 @@ SENSITIVE_WORDS = {
     "process",
     "runbook",
     "runbooks",
+    "review",
+    "reviews",
+    "rfc",
+    "rfcs",
     "sdlc",
     "security",
     "skill",
@@ -191,6 +206,99 @@ def _require_repo(repo: str) -> tuple[str, str]:
 def required_gates(codeql_enabled: bool) -> tuple[GateSpec, ...]:
     """Return the exact source-bound checks in the Shipshape ruleset contract."""
     return BASE_GATES + ((CODEQL_GATE,) if codeql_enabled else ())
+
+
+def derive_protection_request(config: dict, workflow_paths: set[str]) -> dict:
+    """Derive one exact, JSON-safe remote inspection request from local state."""
+    if not isinstance(config, dict):
+        raise GateError("protection configuration was not a JSON object")
+    features = config.get("features")
+    if not isinstance(features, dict) or any(
+        not isinstance(key, str) or type(value) is not bool for key, value in features.items()
+    ):
+        raise GateError("protection configuration feature flags were malformed")
+    required_features = ("branch_protection", "tiered_review", "codeql", "secret_guard")
+    if any(feature not in features for feature in required_features):
+        raise GateError("protection configuration feature flags were incomplete")
+
+    workflow_style = config.get("workflow_style")
+    if workflow_style not in {"trunk", "pr"} or not isinstance(workflow_style, str):
+        raise GateError("protection workflow style must be exactly 'trunk' or 'pr'")
+    branch = config.get("default_branch")
+    if (
+        not isinstance(branch, str)
+        or not branch
+        or branch.startswith("refs/")
+        or any(character in branch for character in "\x00\r\n")
+    ):
+        raise GateError("protection default branch was malformed")
+    languages = config.get("languages")
+    if (
+        not isinstance(languages, list)
+        or not all(
+            isinstance(language, str)
+            and language
+            and language == language.strip()
+            and language == language.lower()
+            for language in languages
+        )
+        or len(languages) != len(set(languages))
+    ):
+        raise GateError("protection languages were malformed")
+    if type(workflow_paths) is not set or not all(
+        isinstance(path, str) and path for path in workflow_paths
+    ):
+        raise GateError("available workflow paths were malformed")
+
+    requested = features["branch_protection"]
+    tiered_review = features["tiered_review"]
+    if tiered_review and (
+        not requested or workflow_style != "pr" or features["secret_guard"] is not True
+    ):
+        raise GateError("tiered review requires PR-style branch protection and the secret guard")
+    repository = config.get("repo")
+    if not isinstance(repository, dict):
+        raise GateError("protection repository metadata was malformed")
+    owner_repo = repository.get("owner_repo")
+    if requested:
+        _require_repo(owner_repo)
+    elif not isinstance(owner_repo, str):
+        raise GateError("protection repository metadata was malformed")
+
+    primary_language = languages[0] if languages else "none"
+    codeql_enabled = features["codeql"] and primary_language in CODEQL_LANGUAGES
+    if codeql_enabled and CODEQL_GATE.workflow_path not in workflow_paths:
+        raise GateError("configured applicable CodeQL workflow was missing")
+
+    gates = ()
+    required_rule_types = []
+    ruleset_name = None
+    if requested and workflow_style == "trunk":
+        required_rule_types = list(TRUNK_RULE_TYPES)
+        ruleset_name = BASELINE_RULESET_NAME
+    elif requested:
+        gates = required_gates(codeql_enabled) if tiered_review else (BASE_GATES[0],)
+        if codeql_enabled and not tiered_review:
+            gates += (CODEQL_GATE,)
+        missing = [gate.workflow_path for gate in gates if gate.workflow_path not in workflow_paths]
+        if missing:
+            raise GateError(f"required protection workflow was missing: {missing[0]}")
+        required_rule_types = ["required_status_checks"]
+        ruleset_name = RULESET_NAME if tiered_review else BASELINE_RULESET_NAME
+
+    return {
+        "requested": requested,
+        "repo": owner_repo,
+        "branch": branch,
+        "workflow_style": workflow_style,
+        "tiered_review": tiered_review,
+        "codeql_enabled": codeql_enabled,
+        "ruleset_name": ruleset_name,
+        "required_checks": [
+            {"context": gate.context, "integration_id": gate.app_id} for gate in gates
+        ],
+        "required_rule_types": required_rule_types,
+    }
 
 
 def _path_with_page(path: str, page: int) -> str:
@@ -360,6 +468,11 @@ def _persistent_auto_merge_actor(api, repo: str, number: int) -> str | None:
         api.graphql(AUTO_MERGE_QUERY, {"owner": owner, "name": name, "number": number}),
         "auto-merge state",
     )
+    errors = payload.get("errors", [])
+    if not isinstance(errors, list):
+        raise GateError("auto-merge GraphQL errors were malformed")
+    if errors:
+        raise GateError("auto-merge GraphQL errors made persistent state unknown")
     data = _require_dict(payload.get("data"), "auto-merge data")
     repository = _require_dict(data.get("repository"), "auto-merge repository")
     pull = _require_dict(repository.get("pullRequest"), "auto-merge pull request")
@@ -420,7 +533,7 @@ def is_ordinary_document(path: str) -> bool:
         return False
     if len(parts) == 1:
         return path in ROOT_DOCUMENTS
-    if parts[0] != "docs":
+    if not any(path.startswith(prefix) for prefix in ORDINARY_DOCUMENT_PREFIXES):
         return False
     suffix = "." + parts[-1].rsplit(".", 1)[-1].lower() if "." in parts[-1] else ""
     return suffix in DOCUMENT_SUFFIXES
@@ -526,7 +639,11 @@ def classify_documentation(files: list, base_tree: dict, head_tree: dict) -> tup
             return "none", "a non-rename unexpectedly had a previous filename"
         paths = [path] + ([previous] if status == "renamed" else [])
         if not all(is_ordinary_document(candidate) for candidate in paths):
-            return "none", "a changed or previous path was not ordinary documentation"
+            return (
+                "none",
+                "a changed or previous path was outside the fixed ordinary-document "
+                "allowlist or used a reserved policy/control name; request human review",
+            )
         if status in {"modified", "removed"} and not _regular_blob(base_tree, path):
             return "none", "a base path was missing or not a regular non-executable blob"
         if status in {"added", "modified", "renamed"} and not _regular_blob(head_tree, path):
@@ -540,7 +657,14 @@ def classify_documentation(files: list, base_tree: dict, head_tree: dict) -> tup
     )
 
 
-def _ruleset_contract(api, repo: str, branch: str, gates: tuple[GateSpec, ...]) -> int:
+def _ruleset_contract(
+    api,
+    repo: str,
+    branch: str,
+    gates: tuple[GateSpec, ...],
+    *,
+    ruleset_name: str = RULESET_NAME,
+) -> int:
     encoded_branch = urllib.parse.quote(branch, safe="")
     active = _list_pages(
         api,
@@ -565,7 +689,7 @@ def _ruleset_contract(api, repo: str, branch: str, gates: tuple[GateSpec, ...]) 
         ruleset = _require_dict(
             api.get(f"repos/{repo}/rulesets/{ruleset_id}"), "repository ruleset"
         )
-        if ruleset.get("name") != RULESET_NAME:
+        if ruleset.get("name") != ruleset_name:
             continue
         matches.append((ruleset_id, ruleset))
     if len(matches) != 1:
@@ -618,6 +742,57 @@ def _ruleset_contract(api, repo: str, branch: str, gates: tuple[GateSpec, ...]) 
     return ruleset_id
 
 
+def _ruleset_rule_types_contract(
+    api, repo: str, branch: str, ruleset_name: str, required_types: tuple[str, ...]
+) -> int:
+    encoded_branch = urllib.parse.quote(branch, safe="")
+    active = _list_pages(
+        api,
+        f"repos/{repo}/rules/branches/{encoded_branch}",
+        "active branch rules",
+    )
+    active_types_by_ruleset = {}
+    for rule in active:
+        if not isinstance(rule, dict):
+            raise GateError("active branch rules contained malformed records")
+        if rule.get("type") not in required_types:
+            continue
+        ruleset_id = rule.get("ruleset_id")
+        if type(ruleset_id) is not int or ruleset_id <= 0:
+            raise GateError("an active safeguard rule lacked a ruleset identity")
+        active_types_by_ruleset.setdefault(ruleset_id, set()).add(rule["type"])
+    candidate_ids = [
+        ruleset_id
+        for ruleset_id, active_types in active_types_by_ruleset.items()
+        if set(required_types).issubset(active_types)
+    ]
+    matches = []
+    for ruleset_id in sorted(candidate_ids):
+        ruleset = _require_dict(
+            api.get(f"repos/{repo}/rulesets/{ruleset_id}"), "repository ruleset"
+        )
+        if ruleset.get("name") == ruleset_name:
+            matches.append((ruleset_id, ruleset))
+    if len(matches) != 1:
+        raise GateError("the active Shipshape safeguard ruleset was missing or ambiguous")
+    ruleset_id, ruleset = matches[0]
+    if (
+        ruleset.get("id") != ruleset_id
+        or ruleset.get("target") != "branch"
+        or ruleset.get("source_type") != "Repository"
+        or ruleset.get("source") != repo
+        or ruleset.get("enforcement") != "active"
+        or ruleset.get("current_user_can_bypass") != "never"
+        or not isinstance(ruleset.get("rules"), list)
+        or not all(isinstance(rule, dict) for rule in ruleset["rules"])
+    ):
+        raise GateError("the Shipshape safeguard ruleset was disabled, bypassable, or malformed")
+    actual_types = {rule.get("type") for rule in ruleset["rules"]}
+    if not set(required_types).issubset(actual_types):
+        raise GateError("the Shipshape safeguard ruleset omitted a required rule")
+    return ruleset_id
+
+
 def inspect_protection(api, repo: str, branch: str, codeql_enabled: bool) -> dict:
     """Return JSON-safe proof for doctor without changing repository protection."""
     gates = required_gates(codeql_enabled)
@@ -637,6 +812,50 @@ def inspect_protection(api, repo: str, branch: str, codeql_enabled: bool) -> dic
         result["ruleset_id"] = _ruleset_contract(api, repo, branch, gates)
         result["ok"] = True
         result["reason"] = "strict source-bound required checks are active"
+    except GateError as error:
+        result["reason"] = str(error)
+    return result
+
+
+def inspect_configured_protection(api, config: dict, workflow_paths: set[str]) -> dict:
+    """Derive and inspect every configured protection mode without mutation."""
+    result = {
+        "ok": False,
+        "requested": None,
+        "request": None,
+        "ruleset_id": None,
+        "reason": "configured protection inspection did not complete",
+    }
+    try:
+        request = derive_protection_request(config, workflow_paths)
+        result["requested"] = request["requested"]
+        result["request"] = request
+        if not request["requested"]:
+            result["ok"] = True
+            result["reason"] = "remote branch protection is not requested by configuration"
+            return result
+        if request["workflow_style"] == "trunk":
+            result["ruleset_id"] = _ruleset_rule_types_contract(
+                api,
+                request["repo"],
+                request["branch"],
+                request["ruleset_name"],
+                tuple(request["required_rule_types"]),
+            )
+            result["reason"] = "deletion and non-fast-forward safeguards are active"
+        else:
+            gates = required_gates(request["codeql_enabled"])
+            if not request["tiered_review"]:
+                gates = (BASE_GATES[0],) + ((CODEQL_GATE,) if request["codeql_enabled"] else ())
+            result["ruleset_id"] = _ruleset_contract(
+                api,
+                request["repo"],
+                request["branch"],
+                gates,
+                ruleset_name=request["ruleset_name"],
+            )
+            result["reason"] = "strict source-bound required checks are active"
+        result["ok"] = True
     except GateError as error:
         result["reason"] = str(error)
     return result
@@ -682,9 +901,13 @@ def _validate_run_identity(
     repository = run.get("repository")
     if (
         type(run.get("id")) is not int
+        or run["id"] <= 0
         or type(run.get("workflow_id")) is not int
+        or run["workflow_id"] <= 0
         or run.get("head_sha") != snapshot["head_sha"]
         or run.get("event") != spec.event
+        # Captured REST runs use bare workflow paths. Ref-suffixed or other
+        # variants remain unsupported because their binding is unproven.
         or run.get("path") != spec.workflow_path
         or not isinstance(repository, dict)
         or repository.get("full_name") != repo
@@ -707,6 +930,31 @@ def _validate_run_identity(
         raise GateError(f"{spec.context} workflow identity was not trusted")
 
 
+def _run_started_at(run: dict, spec: GateSpec) -> datetime:
+    value = run.get("run_started_at")
+    if not isinstance(value, str):
+        raise GateError(f"{spec.context} workflow run chronology was malformed")
+    try:
+        started_at = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise GateError(f"{spec.context} workflow run chronology was malformed") from error
+    if (
+        started_at.strftime("%Y-%m-%dT%H:%M:%SZ") != value
+        or type(run.get("run_attempt")) is not int
+        or run["run_attempt"] < 1
+        or type(run.get("check_suite_id")) is not int
+        or run["check_suite_id"] <= 0
+        or not isinstance(run.get("status"), str)
+        or not run["status"]
+        or (
+            run.get("conclusion") is not None
+            and (not isinstance(run["conclusion"], str) or not run["conclusion"])
+        )
+    ):
+        raise GateError(f"{spec.context} workflow run chronology was malformed")
+    return started_at
+
+
 def _latest_workflow_run(api, repo: str, number: int, snapshot: dict, spec: GateSpec) -> dict:
     workflow_file = urllib.parse.quote(spec.workflow_path.rsplit("/", 1)[-1], safe="")
     query = urllib.parse.urlencode({"event": spec.event, "head_sha": snapshot["head_sha"]})
@@ -716,16 +964,19 @@ def _latest_workflow_run(api, repo: str, number: int, snapshot: dict, spec: Gate
         "workflow_runs",
         f"{spec.context} workflow runs",
     )
+    chronologies = {}
+    seen_run_ids = set()
     for run in runs:
         _validate_run_identity(api, run, repo, number, snapshot, spec)
-    latest = max(runs, key=lambda run: run["id"])
-    if (
-        latest.get("status") != "completed"
-        or latest.get("conclusion") != "success"
-        or type(latest.get("run_attempt")) is not int
-        or latest["run_attempt"] < 1
-        or type(latest.get("check_suite_id")) is not int
-    ):
+        if run["id"] in seen_run_ids:
+            raise GateError(f"{spec.context} workflow run chronology was ambiguous")
+        seen_run_ids.add(run["id"])
+        started_at = _run_started_at(run, spec)
+        if started_at in chronologies:
+            raise GateError(f"{spec.context} workflow run chronology was ambiguous")
+        chronologies[started_at] = run
+    latest = chronologies[max(chronologies)]
+    if latest.get("status") != "completed" or latest.get("conclusion") != "success":
         raise GateError(f"latest {spec.context} workflow run was not successful")
     return latest
 

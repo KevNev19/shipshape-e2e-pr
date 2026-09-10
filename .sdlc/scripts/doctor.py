@@ -32,6 +32,7 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -59,19 +60,24 @@ AGENT_CONTROL_NEXT_ACTION = (
 )
 SCHEDULED_HEALTH_NEXT_ACTION = "Re-run /shipshape-init to restore the scheduled health check."
 TIERED_REVIEW_NEXT_ACTION = "Turn off tiered review until every required check is enforced."
-TIERED_REVIEW_UNVERIFIED = "could not verify that required checks guard auto-merge"
+PROTECTION_UNVERIFIED = "configured remote protection is unverified"
+PROTECTION_NEXT_ACTION = (
+    "Use /shipshape-access to verify or repair the requested remote branch protection."
+)
 TIERED_REVIEW_REMOVE_ACTION = (
     "Remove .github/workflows/low-risk-automerge.yml before relying on tiered review being off."
 )
+PROTECTION_WORKFLOW_PATHS = (
+    ".github/workflows/ci.yml",
+    ".github/workflows/secret-scan.yml",
+    ".github/workflows/codeql.yml",
+)
+LOW_RISK_AUTOMERGE_PATH = ".github/workflows/low-risk-automerge.yml"
 GH_API_TIMEOUT_SECONDS = 10
 HOOK_INSTALL_ACTION = "run: bash .sdlc/hooks/install.sh"
 CI_GUARD_DETAIL = (
     "secret-scan workflow is configured; local hook was not verified in GitHub Actions"
 )
-
-
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def load_json(path: Path) -> dict:
@@ -87,6 +93,86 @@ def load_state(repo: Path) -> dict:
 
 def check(name: str, status: str, detail: str, next_action: str = "") -> dict:
     return {"name": name, "status": status, "detail": detail, "next_action": next_action}
+
+
+def managed_file_findings(repo: Path, destination: str, record: object) -> set[str]:
+    """Inspect one managed path without following symlinks or decoding bytes."""
+    relative = Path(destination)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in ("", ".", "..") for part in relative.parts)
+    ):
+        return {"unverified"}
+
+    current = repo
+    try:
+        for index, part in enumerate(relative.parts):
+            current = current / part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                return {"missing"}
+            if stat.S_ISLNK(info.st_mode):
+                return {"unverified"}
+            if index < len(relative.parts) - 1 and not stat.S_ISDIR(info.st_mode):
+                return {"unverified"}
+        if not stat.S_ISREG(info.st_mode):
+            return {"unverified"}
+        content = current.read_bytes()
+    except OSError:
+        return {"unverified"}
+
+    if not isinstance(record, dict) or not isinstance(record.get("sha256"), str):
+        return {"unverified"}
+    findings = set()
+    if hashlib.sha256(content).hexdigest() != record["sha256"]:
+        findings.add("bytes")
+    recorded_mode = record.get("mode")
+    if recorded_mode is None:
+        findings.add("legacy-mode")
+    elif not isinstance(recorded_mode, str) or re.fullmatch(r"0[0-7]{3}", recorded_mode) is None:
+        findings.add("unverified")
+    elif f"{stat.S_IMODE(info.st_mode):04o}" != recorded_mode:
+        findings.add("mode")
+    return findings
+
+
+def kit_version_check(config: dict, state: dict, current: str, current_label: str) -> dict:
+    config_version = config.get("kit_version", "")
+    completed_version = state.get("completed_kit_version", state.get("kit_version", ""))
+    if config_version == current and completed_version == current:
+        return check("kit version", PASS, f"v{current}")
+
+    details = []
+    if config_version != current:
+        details.append(
+            f"configuration records v{config_version}"
+            if isinstance(config_version, str) and re.fullmatch(r"[0-9A-Za-z._-]+", config_version)
+            else "configuration version is missing or invalid"
+        )
+    if completed_version != current:
+        details.append(
+            f"completed state for the last complete setup records v{completed_version}"
+            if isinstance(completed_version, str)
+            and re.fullmatch(r"[0-9A-Za-z._-]+", completed_version)
+            else "completed state has no valid version"
+        )
+    details.append(f"{current_label} is v{current}")
+    last_run = state.get("last_run_kit_version", "")
+    if (
+        last_run
+        and last_run != completed_version
+        and isinstance(last_run, str)
+        and re.fullmatch(r"[0-9A-Za-z._-]+", last_run)
+    ):
+        details.append(f"last setup attempt used v{last_run}")
+    return check(
+        "kit version",
+        WARN,
+        "; ".join(details),
+        "re-run /shipshape-init to upgrade the managed files",
+    )
 
 
 def find_test_retry_markers(text: str, test_command: str) -> list[str]:
@@ -465,12 +551,55 @@ def guard_installation_check(repo: Path, features: dict, guard: Path) -> dict:
     )
 
 
-def inspect_rendered_protection(
-    repo: Path, owner_repo: str, branch: str, codeql_enabled: bool
-) -> dict:
+def available_protection_workflows(repo: Path) -> set[str]:
+    """Return only fixed workflow paths that are regular files, without following links."""
+    available = set()
+    for relative in PROTECTION_WORKFLOW_PATHS:
+        try:
+            mode = (repo / relative).lstat().st_mode
+        except OSError:
+            continue
+        if stat.S_ISREG(mode):
+            available.add(relative)
+    return available
+
+
+def path_presence(path: Path) -> bool | None:
+    """Return exact directory-entry presence without following a link."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    return True
+
+
+def inspect_rendered_protection(repo: Path, config: dict) -> dict:
     helper = repo / ".sdlc" / "scripts" / "review-gates.py"
-    if not helper.is_file():
-        return {"ok": False, "reason": "the rendered review-gates helper is missing"}
+    try:
+        helper_mode = helper.lstat().st_mode
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "requested": None,
+            "request": None,
+            "reason": "the rendered review-gates helper is missing",
+        }
+    except OSError:
+        return {
+            "ok": False,
+            "requested": None,
+            "request": None,
+            "reason": "the rendered review-gates helper could not be inspected",
+        }
+    if not stat.S_ISREG(helper_mode):
+        return {
+            "ok": False,
+            "requested": None,
+            "request": None,
+            "reason": "the rendered review-gates helper is not a regular file",
+        }
     module_name = "_shipshape_rendered_review_gates"
     try:
         spec = importlib.util.spec_from_file_location(module_name, helper)
@@ -482,8 +611,8 @@ def inspect_rendered_protection(
             spec.loader.exec_module(module)
         finally:
             sys.modules.pop(module_name, None)
-        result = module.inspect_protection(
-            module.GitHubClient(), owner_repo, branch, codeql_enabled
+        result = module.inspect_configured_protection(
+            module.GitHubClient(), config, available_protection_workflows(repo)
         )
     except (AttributeError, ImportError, OSError, RuntimeError, SyntaxError, TypeError) as error:
         return {"ok": False, "reason": f"review-gates inspection unavailable: {error}"}
@@ -492,55 +621,70 @@ def inspect_rendered_protection(
     return result
 
 
-def tiered_review_gates_check(repo: Path, config: dict) -> dict:
-    enabled = config.get("features", {}).get("tiered_review", False)
-    workflow = repo / ".github" / "workflows" / "low-risk-automerge.yml"
-    if not enabled and workflow.is_file():
+def remote_protection_check(repo: Path, config: dict) -> dict:
+    protection = inspect_rendered_protection(repo, config)
+    request = protection.get("request")
+    workflow = repo / LOW_RISK_AUTOMERGE_PATH
+    workflow_present = path_presence(workflow)
+    if workflow_present is None:
         return check(
-            "tiered review gates",
+            "remote protection",
+            FAIL,
+            f"{PROTECTION_UNVERIFIED}: the auto-merge workflow could not be inspected",
+            PROTECTION_NEXT_ACTION,
+        )
+    workflow_is_regular = False
+    if workflow_present:
+        try:
+            workflow_is_regular = stat.S_ISREG(workflow.lstat().st_mode)
+        except OSError:
+            return check(
+                "remote protection",
+                FAIL,
+                f"{PROTECTION_UNVERIFIED}: the auto-merge workflow could not be inspected",
+                PROTECTION_NEXT_ACTION,
+            )
+    if (
+        isinstance(request, dict)
+        and request.get("tiered_review") is True
+        and not workflow_is_regular
+    ):
+        return check(
+            "remote protection",
+            FAIL,
+            "tiered review is on but the auto-merge workflow is missing or not a regular file",
+            TIERED_REVIEW_NEXT_ACTION,
+        )
+    if isinstance(request, dict) and request.get("tiered_review") is False and workflow_present:
+        return check(
+            "remote protection",
             FAIL,
             "tiered review is off but the auto-merge workflow is still present",
             TIERED_REVIEW_REMOVE_ACTION,
         )
-    if not enabled:
-        return check(
-            "tiered review gates",
-            PASS,
-            "tiered review is off; every change needs a person",
-        )
-
-    if not workflow.is_file():
-        return check(
-            "tiered review gates",
-            FAIL,
-            "tiered review is on but the auto-merge workflow is missing",
-            TIERED_REVIEW_NEXT_ACTION,
-        )
-
-    owner_repo = str(config.get("repo", {}).get("owner_repo", "")).strip()
-    branch = str(config.get("default_branch", "main")).strip()
-    if not owner_repo or not branch:
-        return check(
-            "tiered review gates",
-            FAIL,
-            f"{TIERED_REVIEW_UNVERIFIED}: repository or default branch is unavailable",
-            TIERED_REVIEW_NEXT_ACTION,
-        )
-    codeql_enabled = (repo / ".github" / "workflows" / "codeql.yml").is_file()
-    protection = inspect_rendered_protection(repo, owner_repo, branch, codeql_enabled)
     if protection.get("ok") is not True:
         reason = str(protection.get("reason") or "protection inspection did not complete")
         return check(
-            "tiered review gates",
+            "remote protection",
             FAIL,
-            f"{TIERED_REVIEW_UNVERIFIED}: {reason}",
-            TIERED_REVIEW_NEXT_ACTION,
+            f"{PROTECTION_UNVERIFIED}: {reason}",
+            PROTECTION_NEXT_ACTION,
         )
+    if not isinstance(request, dict) or type(protection.get("requested")) is not bool:
+        return check(
+            "remote protection",
+            FAIL,
+            f"{PROTECTION_UNVERIFIED}: the shared inspection result was incomplete",
+            PROTECTION_NEXT_ACTION,
+        )
+    if protection["requested"] is False:
+        return check("remote protection", PASS, str(protection["reason"]))
+
+    mode = "trunk" if request.get("workflow_style") == "trunk" else "PR"
     return check(
-        "tiered review gates",
+        "remote protection",
         PASS,
-        "auto-merge workflow is present and canonical inspection found strict, source-bound "
-        "required checks active",
+        f"configured {mode} protection verified: {protection['reason']}",
     )
 
 
@@ -617,7 +761,7 @@ def security_checks(repo: Path, config: dict) -> list[dict]:
         checks.append(guard_installation_check(repo, features, guard))
 
     checks.append(agent_control_coverage_check(repo, features))
-    checks.append(tiered_review_gates_check(repo, config))
+    checks.append(remote_protection_check(repo, config))
 
     codeql = repo / ".github" / "workflows" / "codeql.yml"
     if codeql.is_file():
@@ -707,13 +851,19 @@ def setup_checks(repo: Path, config: dict, state: dict) -> list[dict]:
     checks.append(test_retries_check(repo, config))
     checks.append(scheduled_health_check(repo, config.get("features", {})))
 
-    drifted, missing = [], []
+    byte_drifted, mode_drifted, legacy_modes, missing, unverified = [], [], [], [], []
     for dest, record in state.get("files", {}).items():
-        path = repo / dest
-        if not path.is_file():
+        findings = managed_file_findings(repo, dest, record)
+        if "missing" in findings:
             missing.append(dest)
-        elif sha256_text(path.read_text(encoding="utf-8")) != record["sha256"]:
-            drifted.append(dest)
+        if "unverified" in findings:
+            unverified.append(dest)
+        if "bytes" in findings:
+            byte_drifted.append(dest)
+        if "mode" in findings:
+            mode_drifted.append(dest)
+        if "legacy-mode" in findings:
+            legacy_modes.append(dest)
     pending_conflicts = [
         item for item in state.get("pending_conflicts", []) if isinstance(item, str)
     ]
@@ -730,6 +880,14 @@ def setup_checks(repo: Path, config: dict, state: dict) -> list[dict]:
             details.append(f"operation errors: {', '.join(error_paths)}")
         if missing:
             details.append(f"missing files: {', '.join(missing)}")
+        if unverified:
+            details.append(f"could not safely inspect: {', '.join(unverified)}")
+        if legacy_modes:
+            details.append(f"legacy state has no recorded mode: {', '.join(legacy_modes)}")
+        if byte_drifted:
+            details.append(f"edited bytes: {', '.join(byte_drifted)}")
+        if mode_drifted:
+            details.append(f"edited modes: {', '.join(mode_drifted)}")
         detail = "; ".join(details) or "completion was not recorded"
         checks.append(
             check(
@@ -740,41 +898,43 @@ def setup_checks(repo: Path, config: dict, state: dict) -> list[dict]:
                 "per-file approval where intended",
             )
         )
-    elif missing:
+    elif missing or unverified or legacy_modes:
+        details = []
+        if missing:
+            details.append(f"shipshape-managed files were deleted: {', '.join(missing)}")
+        if unverified:
+            details.append(f"could not safely inspect: {', '.join(unverified)}")
+        if legacy_modes:
+            details.append(f"legacy state has no recorded mode: {', '.join(legacy_modes)}")
+        if byte_drifted:
+            details.append(f"edited bytes: {', '.join(byte_drifted)}")
+        if mode_drifted:
+            details.append(f"edited modes: {', '.join(mode_drifted)}")
         checks.append(
             check(
                 "managed files",
                 WARN,
-                f"shipshape-managed files were deleted: {', '.join(missing)}",
+                "; ".join(details),
                 "re-run /shipshape-init to restore them, or /shipshape-customize to drop them",
             )
         )
-    elif drifted:
+    elif byte_drifted or mode_drifted:
+        details = []
+        if byte_drifted:
+            details.append(f"edited bytes: {', '.join(byte_drifted)}")
+        if mode_drifted:
+            details.append(f"edited modes: {', '.join(mode_drifted)}")
         checks.append(
             check(
                 "managed files",
                 PASS,
-                f"present; edited by you (which is fine): {', '.join(drifted)}",
+                f"present; edited by you (which is fine); {'; '.join(details)}",
             )
         )
     else:
         checks.append(check("managed files", PASS, "all present and unmodified"))
 
-    written_with = state.get("completed_kit_version", state.get("kit_version", ""))
-    if written_with and written_with != KIT_VERSION:
-        last_run = state.get("last_run_kit_version", "")
-        attempt = f"; last attempted with v{last_run}" if last_run else ""
-        checks.append(
-            check(
-                "kit version",
-                WARN,
-                f"last complete setup used shipshape v{written_with}, rendered doctor is "
-                f"v{KIT_VERSION}{attempt}",
-                "re-run /shipshape-init to upgrade the managed files",
-            )
-        )
-    else:
-        checks.append(check("kit version", PASS, f"v{KIT_VERSION}"))
+    checks.append(kit_version_check(config, state, KIT_VERSION, "rendered doctor"))
     return checks
 
 
