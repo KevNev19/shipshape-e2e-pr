@@ -76,7 +76,7 @@
     ".github/workflows/release.yml": {
       "kit_version": "0.2.1",
       "mode": "0644",
-      "sha256": "9d14f0282b30905a16eb1c2f1c00186d6a0ba046aec440dfc0dbb3de68437d76",
+      "sha256": "f8d86b2547ef4ba92c198dba405e0143e20252c18282d35874a835cf7b111a33",
       "template": "github/workflows/release.yml.tmpl"
     },
     ".github/workflows/secret-scan.yml": {
@@ -118,7 +118,7 @@
     ".sdlc/scripts/release-preflight.py": {
       "kit_version": "0.2.1",
       "mode": "0755",
-      "sha256": "028fa05f90ae57e566a621a9a6cd308fbe2b9ba199e7d195efc58ca011c6e957",
+      "sha256": "4871ed04e5cb181f5a23184707b1485c9c0f5fd909bf8e765577042686120272",
       "template": "scripts/release-preflight.py.tmpl"
     },
     ".sdlc/scripts/review-gates.py": {
