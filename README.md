@@ -5,3 +5,5 @@ Throwaway e2e test repository for the shipshape kit (PR-style, tiered review). S
 One more line of documentation.
 
 F3 fix verification line.
+
+Automatic merge trial: ordinary documentation only.
